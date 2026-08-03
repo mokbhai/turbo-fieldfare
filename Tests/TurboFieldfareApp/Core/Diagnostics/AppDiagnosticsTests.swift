@@ -40,6 +40,75 @@ import Testing
         #expect(missingFirstToken.requestStartTimeToFirstTokenSeconds == nil)
     }
 
+    @Test func promptPrefillRateDividesPromptTokensByPrefillSeconds() throws {
+        let diagnostics = AppDiagnostics(
+            generatedTokens: 8,
+            stopReason: .eos,
+            promptTokenCount: 20,
+            prefillSeconds: 6.17,
+            timeToFirstTokenSeconds: 0.1,
+            decodeSeconds: 1.0,
+            tokensPerSecond: 8.0,
+            peakMemoryBytes: nil,
+            runtimeOptions: AppRuntimeOptions())
+
+        let rate = try #require(diagnostics.promptPrefillTokensPerSecond)
+        // Pins the seconds unit: milliseconds would give ~0.0032 instead.
+        #expect(abs(rate - 3.2415) < 0.001)
+    }
+
+    @Test func promptPrefillRateIsNilWhenInputsAreUnusable() {
+        let missingPromptTokens = AppDiagnostics(
+            generatedTokens: 1,
+            stopReason: .eos,
+            promptTokenCount: nil,
+            prefillSeconds: 6.17,
+            timeToFirstTokenSeconds: 0.1,
+            decodeSeconds: 1.0,
+            tokensPerSecond: 8.0,
+            peakMemoryBytes: nil,
+            runtimeOptions: AppRuntimeOptions())
+        let missingPrefill = AppDiagnostics(
+            generatedTokens: 1,
+            stopReason: .eos,
+            promptTokenCount: 20,
+            prefillSeconds: nil,
+            timeToFirstTokenSeconds: 0.1,
+            decodeSeconds: 1.0,
+            tokensPerSecond: 8.0,
+            peakMemoryBytes: nil,
+            runtimeOptions: AppRuntimeOptions())
+        // A fully cache-resumed prefill can floor to zero; dividing would be inf.
+        let zeroPrefill = AppDiagnostics(
+            generatedTokens: 1,
+            stopReason: .eos,
+            promptTokenCount: 20,
+            prefillSeconds: 0,
+            timeToFirstTokenSeconds: 0.1,
+            decodeSeconds: 1.0,
+            tokensPerSecond: 8.0,
+            peakMemoryBytes: nil,
+            runtimeOptions: AppRuntimeOptions())
+
+        // Wall-clock timing means a negative interval is representable; a
+        // negative rate would render as a plausible-looking "-3.2 tok/s".
+        let negativePrefill = AppDiagnostics(
+            generatedTokens: 1,
+            stopReason: .eos,
+            promptTokenCount: 20,
+            prefillSeconds: -6.17,
+            timeToFirstTokenSeconds: 0.1,
+            decodeSeconds: 1.0,
+            tokensPerSecond: 8.0,
+            peakMemoryBytes: nil,
+            runtimeOptions: AppRuntimeOptions())
+
+        #expect(missingPromptTokens.promptPrefillTokensPerSecond == nil)
+        #expect(missingPrefill.promptPrefillTokensPerSecond == nil)
+        #expect(zeroPrefill.promptPrefillTokensPerSecond == nil)
+        #expect(negativePrefill.promptPrefillTokensPerSecond == nil)
+    }
+
     @Test func runnerDiagnosticsRetainPublicResultAndAdvancedMetrics() {
         let diagnostics = AppRunnerDiagnostics(
             cb1MillisecondsPerToken: 1,

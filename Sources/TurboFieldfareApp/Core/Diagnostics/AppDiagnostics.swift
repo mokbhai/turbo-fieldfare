@@ -62,6 +62,23 @@ public struct AppDiagnostics: Equatable, Sendable {
         return prefillSeconds + timeToFirstTokenSeconds
     }
 
+    /// How fast the prompt became ready, in tokens per second.
+    ///
+    /// The numerator is the whole rendered prompt, including any prefix the
+    /// prompt cache served rather than recomputed, so this measures effective
+    /// throughput rather than raw compute: a cache hit shortens `prefillSeconds`
+    /// without shrinking `promptTokenCount` and therefore reads as a higher
+    /// rate. `cachedPromptTokens` is what a raw-compute figure would subtract.
+    ///
+    /// `prefillSeconds` is seconds, not the milliseconds used by
+    /// `AppRunnerDiagnostics`. The `> 0` guard is required: a fully
+    /// cache-resumed prefill can floor to zero, and dividing by it would yield
+    /// infinity, which renders as `inf` in the inspector.
+    public var promptPrefillTokensPerSecond: Double? {
+        guard let promptTokenCount, let prefillSeconds, prefillSeconds > 0 else { return nil }
+        return Double(promptTokenCount) / prefillSeconds
+    }
+
     public init(generatedTokens: Int,
                 stopReason: AppStopReason,
                 promptTokenCount: Int? = nil,
