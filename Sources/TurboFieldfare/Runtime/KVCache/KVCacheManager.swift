@@ -57,6 +57,10 @@ public final class KVCacheManager {
     private let strides:  [Int]         // bytes per token, per layer
     private let kinds:    [LayerKind]
     private let capacityTokens: [Int]
+    /// The sliding window the SWA attention kernels mask with. Retained because
+    /// `canRewind` needs it: a ring only has slack for a rewind to the extent
+    /// its capacity exceeds the window it must keep resident.
+    private let effectiveSlidingWindow: Int
 
     public private(set) var position: Int = 0
 
@@ -76,11 +80,13 @@ public final class KVCacheManager {
         let ringEnabled = fp16RingEnabled
         self.fp16RingEnabled = ringEnabled
 
+        let window = slidingWindow ?? config.slidingWindow
+        self.effectiveSlidingWindow = window
+
         let swaStride  = config.numKVHeads     * config.headDim     * Self.fp16Size
         let fullStride = config.numFullKVHeads * config.fullHeadDim  * Self.fp16Size
         let swaCapacity = min(maxContext,
-                              max(1, fp16RingCapacityOverride
-                                  ?? ((slidingWindow ?? config.slidingWindow) + maxPrefillChunkTokens)))
+                              max(1, fp16RingCapacityOverride ?? (window + maxPrefillChunkTokens)))
 
         var ks: [MTLBuffer] = []
         var vs: [MTLBuffer] = []
@@ -206,6 +212,71 @@ public final class KVCacheManager {
         precondition(count >= 0, "advance count must be non-negative")
         precondition(position + count <= maxContext, "advance would exceed maxContext")
         position += count
+    }
+
+    /// Whether the cursor can be moved back to `position` without invalidating
+    /// what the buffers hold.
+    ///
+    /// What binds is the rewind *distance*, not the absolute cursor. Re-writing
+    /// positions `p ..< self.position` lands them in the very slots they already
+    /// occupy (`physicalSlot` is `position % capacity`), so nothing older is
+    /// destroyed by the re-prefill itself. What can be missing is history the
+    /// re-prefill needs to *read*: a ring of capacity `C` holds only
+    /// `[self.position - C, self.position)`, and the prefill kernel masks query
+    /// `q` to `first = q + 1 - W` (`Metal/Prefill/prefill.metal:860-861`), so it
+    /// reads the half-open-below window `[q - W + 1, q]`. The binding query is
+    /// the first one recomputed, `q = p`, which needs
+    /// `p - W + 1 >= self.position - C` — that is,
+    /// `self.position - p <= C - W + 1`. Layers sized for the whole context
+    /// never wrap (`advance` bounds the cursor by `maxContext`), so they impose
+    /// no distance limit at all.
+    ///
+    /// The code below deliberately stops one token short of that maximum, at
+    /// `C - W`. The margin costs nothing worth having — the rewinds this exists
+    /// for are bounded by a prefill chunk, far inside the limit either way —
+    /// and it keeps the bound sound if a kernel ever widens its mask back to an
+    /// inclusive `[q - W, q]`. So `C - W + 1` is the true safe maximum and
+    /// `C - W` is what we permit; do not read the `+ 1`'s absence as a
+    /// derivation error.
+    ///
+    /// The slack is clamped at zero for a ring configured too small to hold its
+    /// own window (`C - W < 0`). Such a cache has no room for any *moving*
+    /// rewind, but the zero-distance one must still be allowed: `rewind(to:
+    /// self.position)` changes nothing, and refusing it would make the no-op
+    /// trip `rewind`'s own precondition and abort the process.
+    public func canRewind(to position: Int) -> Bool {
+        guard position >= 0, position <= self.position else { return false }
+        let distance = self.position - position
+        for layer in 0..<capacityTokens.count {
+            let capacity = capacityTokens[layer]
+            if capacity == maxContext { continue }
+            if distance > max(0, capacity - effectiveSlidingWindow) { return false }
+        }
+        return true
+    }
+
+    /// Whether a completion can start from exactly `position` cached tokens.
+    ///
+    /// This is `canRewind` plus the one thing a resume needs that a bare rewind
+    /// does not: zero cached tokens is a legal rewind (back to an empty cache)
+    /// but not a resume, and the callers asking this are choosing between
+    /// resuming and resetting, so "nothing is reusable" has to read as false.
+    ///
+    /// It lives here rather than in the runner so it can be tested against a
+    /// real cache: the runner cannot be constructed without the checkpoint.
+    func canResume(from position: Int) -> Bool {
+        position > 0 && canRewind(to: position)
+    }
+
+    /// Move the cursor back to `position`, keeping `[0, position)` valid.
+    ///
+    /// No buffer work: the attention kernels read only `[0, validTokenCount)`
+    /// and every view derives its extent from `position`, so the slots above the
+    /// new cursor are simply overwritten by the next writes.
+    public func rewind(to position: Int) {
+        precondition(canRewind(to: position),
+                     "cannot rewind KV cursor from \(self.position) to \(position)")
+        self.position = position
     }
 
     /// Drop all cached positions and return physical pages to the OS.

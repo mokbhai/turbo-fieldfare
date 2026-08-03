@@ -225,19 +225,19 @@ public actor ServerModelSession: ServerInferenceBackend {
         let effectivePromptIDs: [Int32]
         let completionStart: RawCompletionStart
         if promptCacheMode == .singlePrefix {
-            switch promptCache.match(
-                domain: promptCacheDomain,
-                request: request,
-                renderedPromptIDs: promptIDs,
-                tokenizer: tokenizer) {
-            case .miss:
+            let resolution = ServerPromptCacheDecision.resolve(
+                match: promptCache.match(
+                    domain: promptCacheDomain,
+                    request: request,
+                    renderedPromptIDs: promptIDs,
+                    tokenizer: tokenizer),
+                canResume: { runner.canResume(from: $0) },
+                promptIDs: promptIDs)
+            if resolution.invalidatesCache {
                 promptCache.invalidate()
-                effectivePromptIDs = promptIDs
-                completionStart = .reset
-            case .hit(let effective, let cached):
-                effectivePromptIDs = effective
-                completionStart = .resume(cachedPromptTokens: cached)
             }
+            effectivePromptIDs = resolution.effectivePromptIDs
+            completionStart = resolution.start
         } else {
             promptCache.invalidate()
             effectivePromptIDs = promptIDs

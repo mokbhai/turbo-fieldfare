@@ -12,7 +12,15 @@ public protocol LogitProducer: AnyObject, Sendable {
 
 public protocol ContinuableLogitProducer: LogitProducer {
     var continuationPosition: Int { get }
-    func prepareForContinuation(expectedPosition: Int) throws
+    /// Ready the producer to continue from `expectedPosition`.
+    ///
+    /// `allowingRewind` is opt-in because a rewind trades an integrity check for
+    /// reuse: without it a cursor that disagrees with the caller's bookkeeping is
+    /// an error, which is the only guard a caller that does not probe first ever
+    /// gets. Only callers that have verified the shorter prefix really is the KV's
+    /// own prefix may ask for it. Passing `false` is the fail-closed choice: the
+    /// cursor must already be exactly where the caller expects it.
+    func prepareForContinuation(expectedPosition: Int, allowingRewind: Bool) throws
 }
 
 protocol ContextWindowReporting: Sendable {
