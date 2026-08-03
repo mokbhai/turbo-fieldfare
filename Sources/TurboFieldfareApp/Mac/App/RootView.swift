@@ -106,7 +106,7 @@ struct RootView: View {
         VStack(spacing: 10) {
             ContextOverflowBanner(model: model)
             ErrorBanner(model: model)
-            if model.promptText.isEmpty {
+            if model.isPromptExamplesCardVisible {
                 PromptExamplesView { preset in
                     model.promptText = preset.prompt
                 }
@@ -115,6 +115,10 @@ struct RootView: View {
         }
         .padding(.horizontal, 20)
         .padding(.bottom, 16)
+        .animation(.smooth(duration: 0.2), value: model.isPromptExamplesCardVisible)
+        // `PromptComposerView` resizes its editor between 46pt and 84pt on this
+        // same value, inside this VStack, so the card's trigger used to animate
+        // that height for free. It no longer does, hence the second trigger.
         .animation(.smooth(duration: 0.2), value: model.promptText.isEmpty)
     }
 }
