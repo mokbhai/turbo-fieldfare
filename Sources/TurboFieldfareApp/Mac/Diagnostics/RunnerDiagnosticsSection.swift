@@ -15,6 +15,11 @@ struct RunnerDiagnosticsSection: View {
 
                 groupLabel("Performance")
                 DiagnosticRow("Prompt prefill", MetricFormat.seconds(diagnostics.prefillSeconds))
+                // Hidden rather than dashed when the rate is unavailable, so the
+                // row never implies a throughput that was not measured.
+                if let promptPrefillRate = diagnostics.promptPrefillTokensPerSecond {
+                    DiagnosticRow("Prompt prefill rate", "\(MetricFormat.rate(promptPrefillRate)) tok/s")
+                }
                 DiagnosticRow("First token wait", MetricFormat.seconds(diagnostics.timeToFirstTokenSeconds))
                 DiagnosticRow("Request TTFT", MetricFormat.seconds(diagnostics.requestStartTimeToFirstTokenSeconds))
                 DiagnosticRow("Decode duration", MetricFormat.seconds(diagnostics.decodeSeconds))
