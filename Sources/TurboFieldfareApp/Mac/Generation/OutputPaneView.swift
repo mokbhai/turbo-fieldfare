@@ -27,22 +27,23 @@ struct OutputPaneView: View {
             Button("Copy response") {
                 copyResponse()
             }
-            .disabled(model.outputResponsePlainText.isEmpty)
+            .disabled(model.viewedResponsePlainText.isEmpty)
 
             Button("Copy prompt") {
-                copy(model.outputPromptText)
+                copy(model.viewedOutputPromptText)
             }
-            .disabled(model.outputPromptText.isEmpty)
+            .disabled(model.viewedOutputPromptText.isEmpty)
 
             Button("Copy conversation") {
-                copy(model.outputConversationPlainText)
+                copy(model.viewedConversationPlainText)
             }
-            .disabled(model.outputConversationPlainText.isEmpty)
+            .disabled(model.viewedConversationPlainText.isEmpty)
 
             Divider()
 
             Button("Clear") { model.clearOutput() }
-                .disabled(model.isRunning || !model.hasOutputTranscript)
+                .disabled(model.isRunningInActiveConversation
+                          || !model.hasOutputTranscript)
         }
     }
 
@@ -64,15 +65,20 @@ struct OutputPaneView: View {
                 TranscriptTurn(role: $0.role == .user ? .user : .assistant,
                                content: $0.content)
             },
-            prompt: model.outputPromptText,
-            output: model.outputText,
-            mailbox: model.generationTranscriptMailbox,
-            isTerminal: !model.isRunning,
-            showsPrefillPlaceholder: model.isRunning
-                && model.outputResponsePlainText.isEmpty)
+            // Every live value is viewed-scoped: a run belonging to another chat
+            // must contribute nothing here. `mailbox` especially — the
+            // coordinator drains it on its own timer, so a non-nil mailbox would
+            // append another conversation's tokens to this transcript.
+            prompt: model.viewedOutputPromptText,
+            output: model.viewedOutputText,
+            mailbox: model.viewedTranscriptMailbox,
+            isTerminal: !model.isRunningInActiveConversation,
+            showsPrefillPlaceholder: model.isRunningInActiveConversation
+                && model.viewedResponsePlainText.isEmpty)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .overlay(alignment: .topTrailing) {
-                if !model.isRunning && !model.outputResponsePlainText.isEmpty {
+                if !model.isRunningInActiveConversation
+                    && !model.viewedResponsePlainText.isEmpty {
                     copyResponseButton
                         .padding(8)
                 }
@@ -179,7 +185,7 @@ struct OutputPaneView: View {
     }
 
     private func copyResponse() {
-        copy(model.outputResponsePlainText)
+        copy(model.viewedResponsePlainText)
         withAnimation(.easeIn(duration: 0.15)) {
             responseCopyFeedbackID = UUID()
         }

@@ -23,8 +23,8 @@ import Testing
     try await waitForFakeClient { model.diagnostics != nil && !model.isRunning }
 
     #expect(model.isModelInstalled)
-    #expect(model.outputConversationPlainText.contains("Simulated response"))
-    #expect(model.outputConversationPlainText.contains("Hello from the test"))
+    #expect(model.viewedConversationPlainText.contains("Simulated response"))
+    #expect(model.viewedConversationPlainText.contains("Hello from the test"))
     #expect(model.diagnostics?.generatedTokens ?? 0 > 0)
   }
 

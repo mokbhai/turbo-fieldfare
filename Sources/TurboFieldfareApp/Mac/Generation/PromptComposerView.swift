@@ -107,7 +107,9 @@ struct PromptComposerView: View {
 
     @ViewBuilder
     private var clearAction: some View {
-        if !model.isRunning && model.hasOutputTranscript {
+        // Scoped to the conversation on screen: an idle chat must still be able
+        // to clear its own transcript or composer while another one generates.
+        if !model.isRunningInActiveConversation && model.hasOutputTranscript {
             Button {
                 model.clearOutput()
             } label: {
@@ -118,7 +120,7 @@ struct PromptComposerView: View {
             }
             .buttonStyle(.borderless)
             .help("Clear output")
-        } else if !model.isRunning && !model.promptText.isEmpty {
+        } else if !model.isRunningInActiveConversation && !model.promptText.isEmpty {
             Button {
                 model.promptText = ""
                 promptFocused = true

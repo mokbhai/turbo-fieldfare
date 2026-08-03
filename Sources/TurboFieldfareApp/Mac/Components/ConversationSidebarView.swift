@@ -28,7 +28,6 @@ struct ConversationSidebarView: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.borderless)
-            .disabled(model.isRunning)
             .help("New Chat")
         }
         .padding(.horizontal, 14)
@@ -83,7 +82,6 @@ struct ConversationSidebarView: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .disabled(model.isRunning && !isActive)
                 .contextMenu {
                     Button("Rename…") {
                         renameText = conversation.title
@@ -92,7 +90,6 @@ struct ConversationSidebarView: View {
                     Button("Delete", role: .destructive) {
                         pendingDeletionID = conversation.id
                     }
-                    .disabled(model.isRunning)
                 }
             }
         }
@@ -109,14 +106,31 @@ struct ConversationSidebarView: View {
             }
             Button("Cancel", role: .cancel) { pendingDeletionID = nil }
         } message: {
-            Text("\(conversation.title) will be removed permanently.")
+            Text(deletionMessage(conversation))
         }
     }
 
+    /// Deleting a generating chat stops its reply, so the confirmation has to
+    /// say so: the run is not visible from every other chat, and losing it is
+    /// the part of the deletion the user cannot undo by reading history.
+    private func deletionMessage(_ conversation: Conversation) -> String {
+        let removal = "\(conversation.title) will be removed permanently."
+        guard model.isGenerating(conversation.id) else { return removal }
+        return removal + " The reply still generating in it will stop."
+    }
+
     private func subtitle(_ conversation: Conversation) -> String {
-        guard !conversation.isEmpty else { return "Empty" }
+        // Marks the generating row in text rather than with a pulsing dot: same
+        // information, without an animation running inside a LazyVStack for the
+        // length of a 26B generation.
+        let generating = model.isGenerating(conversation.id)
+        guard !conversation.isEmpty else { return generating ? "Generating…" : "Empty" }
         let exchanges = conversation.turns.filter { $0.role == .user }.count
-        return exchanges == 1 ? "1 message" : "\(exchanges) messages"
+        let count = exchanges == 1 ? "1 message" : "\(exchanges) messages"
+        // Keep the count while generating: it is what the user scans the list
+        // by, and losing it for the length of a 26B run makes a busy chat
+        // harder to find than an idle one.
+        return generating ? "\(count) · generating…" : count
     }
 
     private func commitRename(_ id: UUID) {

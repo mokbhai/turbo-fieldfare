@@ -391,4 +391,40 @@ import Testing
             wasAtBottom: false,
             mutation: .appended))
     }
+
+    /// Viewing a conversation that owns no live turn hands the controller an
+    /// empty prompt, an empty response and `isTerminal: true`. The document has
+    /// to come back down to that conversation's committed turns: any residue
+    /// would be another chat's answer rendered inside this one.
+    @Test func viewingAConversationWithoutALiveTurnLeavesNoResidue() {
+        let storage = NSMutableAttributedString()
+        let controller = InstructionTranscriptDocumentController()
+
+        controller.synchronize(
+            storage: storage,
+            committed: [
+                TranscriptTurn(role: .user, content: "asked earlier"),
+                TranscriptTurn(role: .assistant, content: "answered earlier"),
+            ],
+            prompt: "streaming prompt",
+            response: "streaming answer",
+            isTerminal: false)
+        #expect(storage.string.contains("streaming prompt"))
+        #expect(storage.string.contains("streaming answer"))
+
+        let update = controller.synchronize(
+            storage: storage,
+            committed: [TranscriptTurn(role: .user, content: "a different chat")],
+            prompt: "",
+            response: "",
+            isTerminal: true)
+
+        #expect(update.mutation == .rebuilt)
+        #expect(storage.string.contains("a different chat"))
+        #expect(!storage.string.contains("streaming prompt"))
+        #expect(!storage.string.contains("streaming answer"))
+        #expect(!storage.string.contains("asked earlier"))
+        // No dangling "Answer" header either: there is no live section here.
+        #expect(!storage.string.contains("Answer"))
+    }
 }
