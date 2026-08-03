@@ -588,7 +588,7 @@ import Testing
             tokensPerSecond: 1,
             peakMemoryBytes: nil,
             runtimeOptions: AppRuntimeOptions())
-        model.error = .unknown("old error")
+        model.setGlobalError(.unknown("old error"))
 
         model.setModelURL(newURL)
 
