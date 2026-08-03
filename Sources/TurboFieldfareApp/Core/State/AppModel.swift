@@ -12,6 +12,17 @@ public final class AppModel {
     }
 
     public var modelPathText: String
+    /// The composer's text. Cleared at exactly one place — the point in `run()`
+    /// where the request is accepted — so a sent prompt does not linger as if it
+    /// were still unsent, a refused send never destroys what the user typed, and
+    /// a prompt typed while an answer streams survives the terminal event. The
+    /// sent copy lives on in `outputPromptText` and then in the committed turns.
+    /// The single path back is `restoreSubmittedPromptIfComposerIsEmpty()`, which
+    /// a cancelled or failed run uses because it commits no turn.
+    ///
+    /// Because of that, an empty composer no longer implies "nothing has been
+    /// sent yet" — anything wanting that older meaning must ask
+    /// `isPromptExamplesCardVisible` instead.
     public var promptText: String = ""
     /// The in-flight exchange. Committed turns live in `activeConversation`;
     /// these two hold the turn being generated right now, so the transcript's
@@ -265,6 +276,31 @@ public final class AppModel {
 
     public var hasOutputTranscript: Bool {
         !committedTurns.isEmpty || !outputPromptText.isEmpty || !outputText.isEmpty
+    }
+
+    /// Whether the prompt-examples card belongs on screen.
+    ///
+    /// The invariant it encodes is "this conversation is genuinely fresh":
+    /// nothing typed, nothing on screen from an earlier exchange, and no run in
+    /// flight. Testing `promptText.isEmpty` alone used to be equivalent, because
+    /// an empty composer meant nothing had been sent — but `run()` now clears
+    /// the composer the instant a request is accepted, so that test would let
+    /// the full-width card animate back in *while* the answer streams and resize
+    /// the chrome under it.
+    ///
+    /// `hasOutputTranscript` covers both the committed turns and the live turn,
+    /// which a cancelled or failed run deliberately leaves on screen — those
+    /// states are not fresh, and `clearOutput()` or a new conversation is what
+    /// makes them fresh again.
+    ///
+    /// `isRunning` is a belt-and-braces clause, not a discriminator: `run()`
+    /// assigns `outputPromptText` before it marks the run running, so
+    /// `hasOutputTranscript` is already true for every instant of a run. It is
+    /// kept because that equivalence rests on `latestUserContent` finding a user
+    /// message, and `run()` falls back to `""` when it does not — under that
+    /// fallback `isRunning` is the only thing left holding the card off screen.
+    public var isPromptExamplesCardVisible: Bool {
+        promptText.isEmpty && !hasOutputTranscript && !isRunning
     }
 
     public var outputResponsePlainText: String {
@@ -1094,6 +1130,9 @@ public final class AppModel {
 
         generationTranscriptMailbox?.reset()
         outputPromptText = request.latestUserContent ?? ""
+        // The request is accepted from here on; see `promptText` for why the
+        // composer is cleared here and nowhere else.
+        promptText = ""
         outputText = ""
         diagnostics = nil
         error = nil
@@ -1196,7 +1235,31 @@ public final class AppModel {
         materializeServiceTranscript()
         self.diagnostics = diagnostics
         error = .cancelled
+        restoreSubmittedPromptIfComposerIsEmpty()
         finishTerminalRun()
+    }
+
+    /// Puts the submitted prompt back in the composer after a terminal path that
+    /// committed nothing.
+    ///
+    /// Clearing the composer the moment a request is accepted is safe for a
+    /// successful run, because the prompt has landed in the committed turns and
+    /// the user can read it back there. A cancelled or failed run deliberately
+    /// commits nothing, so the only surviving copy is the live turn — and the
+    /// live turn is exactly what the composer's "Clear output" button offers to
+    /// throw away. Without this, one failed generation would destroy what the
+    /// user typed with no way back; with it, Generate is armed with the same
+    /// text and retrying is a single click.
+    ///
+    /// The empty-composer guard is what stops this from fighting the user: if
+    /// they began typing the next prompt while the answer streamed, that text is
+    /// newer than the one being restored and must win. Emptiness is measured the
+    /// same way `canRun` measures it — trimmed — because a composer holding only
+    /// a stray space the user tapped mid-stream has nothing worth keeping, and
+    /// treating it as occupied would discard the submitted prompt instead.
+    private func restoreSubmittedPromptIfComposerIsEmpty() {
+        guard promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        promptText = outputPromptText
     }
 
     private func materializeServiceTranscript() {
@@ -1208,6 +1271,7 @@ public final class AppModel {
         guard !hasHandledTerminalEvent else { return }
         hasHandledTerminalEvent = true
         error = appError
+        restoreSubmittedPromptIfComposerIsEmpty()
         finishTerminalRun()
     }
 
