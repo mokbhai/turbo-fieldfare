@@ -52,6 +52,11 @@ name the changed setting.
 ## Read the results
 
 - **Decode rate** measures generated tokens per second after prompt prefill.
+- **Prompt prefill rate** divides the whole prompt token count by the prompt
+  prefill time, so it reports how fast the prompt became ready rather than how
+  fast tokens were computed. Reuse from the prompt cache shortens the prefill
+  without shrinking the count, and so raises the rate. The row is hidden when
+  either value is unavailable, and when the prefill time is zero.
 - **Request TTFT** includes prompt prefill and the wait for the first generated
   token.
 - **Peak memory** in Last run is the highest decode-service memory observed

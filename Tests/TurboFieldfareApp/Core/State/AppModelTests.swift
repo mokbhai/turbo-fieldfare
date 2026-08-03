@@ -165,6 +165,276 @@ import Testing
     }
 
     @MainActor
+    @Test func acceptedRunClearsComposerButKeepsPromptInTranscript() async throws {
+        let client = MockInferenceClient(response: "answer", tokenDelayNanos: 1)
+        let model = readyModel(client: client)
+        model.promptText = "original prompt"
+        model.maxNewTokensOverride = 1
+
+        // The composer still feeds the request; only the accepted send clears it.
+        let request = try model.makeRequest()
+        #expect(request.messages.last?.content == "original prompt")
+        #expect(request.messages.last?.role == .user)
+
+        model.run()
+
+        #expect(model.promptText.isEmpty)
+        #expect(model.outputPromptText == "original prompt")
+        #expect(model.outputConversationPlainText == "You:\noriginal prompt")
+
+        // A prompt typed while the answer streams must survive the terminal event.
+        model.promptText = "next prompt"
+        await waitForIdle(model)
+
+        #expect(model.promptText == "next prompt")
+        #expect(model.committedTurns.map(\.content) == ["original prompt", "answer"])
+    }
+
+    @MainActor
+    @Test func refusedRunKeepsComposerText() async throws {
+        let blankPrompt = readyModel(client: MockInferenceClient())
+        blankPrompt.promptText = "   "
+        #expect(!blankPrompt.canRun)
+        blankPrompt.run()
+        #expect(blankPrompt.promptText == "   ")
+
+        let notReady = AppModel(client: MockInferenceClient())
+        notReady.promptText = "go"
+        #expect(!notReady.canRun)
+        notReady.run()
+        #expect(notReady.promptText == "go")
+
+        let overflowing = readyModel(client: MockInferenceClient())
+        overflowing.maxContextTokens = 4_096
+        let longPrompt = String(repeating: "x", count: 4_096 * 4)
+        overflowing.promptText = longPrompt
+        #expect(overflowing.isConversationOverflowing)
+        #expect(overflowing.canRun)
+        overflowing.run()
+        #expect(overflowing.isContextOverflowNoticeVisible)
+        #expect(overflowing.promptText == longPrompt)
+
+        let invalidRequest = readyModel(client: MockInferenceClient())
+        invalidRequest.promptText = "go"
+        invalidRequest.topK = 300
+        invalidRequest.run()
+        #expect(invalidRequest.error != nil)
+        #expect(!invalidRequest.isRunning)
+        #expect(invalidRequest.promptText == "go")
+
+        // The `isRunning` arm of `canRun`: hitting send while an answer streams
+        // must not swallow the text typed for the next send.
+        let busy = readyModel(
+            client: MockInferenceClient(response: "one two three", tokenDelayNanos: 20_000_000))
+        busy.promptText = "first"
+        busy.run()
+        #expect(busy.isRunning)
+        busy.promptText = "second"
+        #expect(!busy.canRun)
+        busy.run()
+        #expect(busy.promptText == "second")
+        busy.cancel()
+        await waitForIdle(busy)
+        #expect(busy.promptText == "second")
+    }
+
+    @MainActor
+    @Test func cancelledRunKeepsComposerText() async throws {
+        let client = MockInferenceClient(response: "one two three", tokenDelayNanos: 20_000_000)
+        client.prefillSteps = 0
+        let model = readyModel(client: client)
+        model.promptText = "cancel me"
+        model.run()
+        #expect(model.promptText.isEmpty)
+
+        model.promptText = "typed during run"
+        for _ in 0..<200 where model.liveTokenCount == 0 {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        // A poll that times out would leave this asserting a pre-decode state.
+        #expect(model.liveTokenCount > 0)
+        model.cancel()
+        await waitForIdle(model)
+
+        #expect(model.error == .cancelled)
+        #expect(model.promptText == "typed during run")
+    }
+
+    @MainActor
+    @Test func failedRunRestoresThePromptToAnEmptyComposer() async throws {
+        let client = MockInferenceClient(tokenDelayNanos: 1, failureMessage: "synthetic failure")
+        let model = readyModel(client: client)
+        model.promptText = "retry me"
+        model.run()
+        #expect(model.promptText.isEmpty)
+
+        await waitForIdle(model)
+
+        // Nothing was committed, so the composer is the only place the prompt can
+        // survive an offer to clear the output. Retrying must cost one click.
+        #expect(model.error != nil)
+        #expect(model.committedTurns.isEmpty)
+        #expect(model.promptText == "retry me")
+        #expect(model.canRun)
+    }
+
+    @MainActor
+    @Test func failedRunRestoresThePromptOverWhitespaceTypedMidStream() async throws {
+        let client = MockInferenceClient(tokenDelayNanos: 1, failureMessage: "synthetic failure")
+        let model = readyModel(client: client)
+        model.promptText = "retry me"
+        model.run()
+        // A stray space is not a prompt the user is protecting. Measuring
+        // emptiness untrimmed here would treat it as one and drop "retry me".
+        model.promptText = "  \n "
+        await waitForIdle(model)
+
+        #expect(model.error != nil)
+        #expect(model.promptText == "retry me")
+        #expect(model.canRun)
+    }
+
+    @MainActor
+    @Test func cancelledRunRestoresThePromptToAnEmptyComposer() async throws {
+        let client = MockInferenceClient(response: "one two three", tokenDelayNanos: 20_000_000)
+        client.prefillSteps = 0
+        let model = readyModel(client: client)
+        model.promptText = "cancel me"
+        model.run()
+        #expect(model.promptText.isEmpty)
+
+        for _ in 0..<200 where model.liveTokenCount == 0 {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        #expect(model.liveTokenCount > 0)
+        model.cancel()
+        await waitForIdle(model)
+
+        #expect(model.error == .cancelled)
+        #expect(model.committedTurns.isEmpty)
+        #expect(model.promptText == "cancel me")
+        #expect(model.canRun)
+    }
+
+    @MainActor
+    @Test func failedRunKeepsTypedAheadTextInsteadOfTheRestoredPrompt() async throws {
+        let client = MockInferenceClient(tokenDelayNanos: 1, failureMessage: "synthetic failure")
+        let model = readyModel(client: client)
+        model.promptText = "fail"
+        model.run()
+
+        model.promptText = "typed during run"
+        await waitForIdle(model)
+
+        // The restore is for an untouched composer only: text typed while the
+        // run was in flight is newer than the submitted prompt and wins.
+        #expect(model.error != nil)
+        #expect(model.promptText == "typed during run")
+        #expect(model.outputPromptText == "fail")
+    }
+
+    @MainActor
+    @Test func successfulRunLeavesTheComposerClear() async throws {
+        let model = readyModel(client: MockInferenceClient(response: "answer", tokenDelayNanos: 1))
+        model.promptText = "a question"
+        model.maxNewTokensOverride = 1
+        model.run()
+        await waitForIdle(model)
+
+        // A committed turn is a recoverable copy, so there is nothing to restore
+        // and the composer stays ready for the next prompt.
+        #expect(model.error == nil)
+        #expect(model.committedTurns.map(\.content) == ["a question", "answer"])
+        #expect(model.promptText.isEmpty)
+    }
+
+    @MainActor
+    @Test func promptExamplesCardShowsOnlyInAFreshConversation() {
+        let model = readyModel(client: MockInferenceClient())
+        #expect(model.isPromptExamplesCardVisible)
+
+        model.promptText = "a question"
+        #expect(!model.isPromptExamplesCardVisible)
+
+        model.promptText = ""
+        #expect(model.isPromptExamplesCardVisible)
+    }
+
+    @MainActor
+    @Test func promptExamplesCardStaysHiddenWhileTheAnswerStreams() async throws {
+        let client = MockInferenceClient(response: "one two three", tokenDelayNanos: 20_000_000)
+        client.prefillSteps = 0
+        let model = readyModel(client: client)
+        model.promptText = "a question"
+        model.run()
+
+        // Accepting the request empties the composer, so `promptText.isEmpty` is
+        // true from here on. The card must stay hidden anyway: showing it would
+        // animate a full-width panel in over the streaming answer.
+        #expect(model.promptText.isEmpty)
+        #expect(model.isRunning)
+        #expect(!model.isPromptExamplesCardVisible)
+
+        for _ in 0..<200 where model.liveTokenCount == 0 {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        #expect(model.liveTokenCount > 0)
+        #expect(!model.isPromptExamplesCardVisible)
+    }
+
+    @MainActor
+    @Test func promptExamplesCardStaysHiddenAfterASuccessfulRun() async throws {
+        let model = readyModel(client: MockInferenceClient(response: "answer", tokenDelayNanos: 1))
+        model.promptText = "a question"
+        model.maxNewTokensOverride = 1
+        model.run()
+        await waitForIdle(model)
+
+        // A cleared composer over a committed transcript is not a fresh chat.
+        #expect(!model.committedTurns.isEmpty)
+        #expect(model.promptText.isEmpty)
+        #expect(!model.isPromptExamplesCardVisible)
+    }
+
+    @MainActor
+    @Test func promptExamplesCardStaysHiddenAfterACancelledOrFailedRunUntilCleared() async throws {
+        // Neither terminal path commits its turn, but both leave the exchange on
+        // screen, so the state is not fresh. Only clearing the output is.
+        let cancelledClient = MockInferenceClient(response: "one two three", tokenDelayNanos: 20_000_000)
+        cancelledClient.prefillSteps = 0
+        let cancelled = readyModel(client: cancelledClient)
+        cancelled.promptText = "a question"
+        cancelled.run()
+        for _ in 0..<200 where cancelled.liveTokenCount == 0 {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        #expect(cancelled.liveTokenCount > 0)
+        cancelled.cancel()
+        await waitForIdle(cancelled)
+
+        #expect(cancelled.error == .cancelled)
+        #expect(cancelled.hasOutputTranscript)
+        // The prompt came back to the composer, which hides the card on its own.
+        #expect(cancelled.promptText == "a question")
+        #expect(!cancelled.isPromptExamplesCardVisible)
+
+        cancelled.clearOutput()
+        #expect(!cancelled.isPromptExamplesCardVisible)
+        cancelled.promptText = ""
+        #expect(cancelled.isPromptExamplesCardVisible)
+
+        let failed = readyModel(
+            client: MockInferenceClient(tokenDelayNanos: 1, failureMessage: "synthetic failure"))
+        failed.promptText = "a question"
+        failed.run()
+        await waitForIdle(failed)
+
+        #expect(failed.error != nil)
+        #expect(failed.hasOutputTranscript)
+        #expect(!failed.isPromptExamplesCardVisible)
+    }
+
+    @MainActor
     @Test func successiveRunsAccumulateTurnsAndSendTheWholeConversation() async throws {
         let client = MockInferenceClient(response: "answer", tokenDelayNanos: 1)
         let model = readyModel(client: client)
