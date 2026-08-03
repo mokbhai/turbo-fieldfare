@@ -5,7 +5,7 @@ struct MacAppSettings: Codable, Equatable, Sendable {
     static let currentVersion = 1
 
     var version: Int = currentVersion
-    var contextTokens: Int = AppContextLengthOption.fourK.tokens
+    var contextTokens: Int = AppContextLengthOption.defaultTokens
     var expertCacheSlots: Int = 16
     var temperature: Double = 0.2
     var topKEnabled: Bool = true
@@ -16,7 +16,7 @@ struct MacAppSettings: Codable, Equatable, Sendable {
 
     func isValid() -> Bool {
         version == Self.currentVersion
-            && AppContextLengthOption.allCases.contains { $0.tokens == contextTokens }
+            && AppContextLengthOption.candidateTokens.contains(contextTokens)
             && AppRuntimeOptions.allowedSlotCounts.contains(expertCacheSlots)
             && temperature.isFinite && (0...2).contains(temperature)
             && (1...256).contains(topK)
@@ -41,7 +41,15 @@ enum MacAppSettingsFileStore {
                 guard settings.isValid() else { throw InvalidSettings() }
                 return settings
             } catch {
-                try? fileManager.removeItem(at: fileURL)
+                // Renamed, not deleted: settings are cheap to recreate but the
+                // user did choose them, and nothing here justifies destroying
+                // a file behind their back.
+                let backup = fileURL.deletingLastPathComponent()
+                    .appendingPathComponent("mac-app-settings.corrupt.json", isDirectory: false)
+                try? fileManager.removeItem(at: backup)
+                if (try? fileManager.moveItem(at: fileURL, to: backup)) == nil {
+                    try? fileManager.removeItem(at: fileURL)
+                }
             }
         }
 

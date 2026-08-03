@@ -34,11 +34,24 @@ public final class AppModel {
     public var topP: Double = 0.95
     public var diagnostics: AppDiagnostics?
     public var error: AppInferenceError?
-    public var installState: AppModelInstallState = .idle
+    /// Mirrored into `installStates` on every write so the picker's per-row
+    /// progress stays in step with the single-model state the existing install
+    /// UI reads, without duplicating the assignment at each transition.
+    public var installState: AppModelInstallState = .idle {
+        didSet { installStates.setState(installState, for: selectedRepoID) }
+    }
     public private(set) var installETAPresentation: DownloadETAPresentation = .hidden
     public private(set) var installETAText: String?
     public private(set) var installReadiness: AppModelInstallReadiness = .checking
     public private(set) var installationStatus: AppModelInstallationStatus
+
+    /// Curated entries merged with whatever the user has added.
+    public private(set) var catalog: ModelCatalog = ModelCatalog(custom: [])
+    /// Install progress for every known model, so the picker can render each
+    /// row independently of the single-model `installState` above.
+    public private(set) var installStates = ModelInstallStates()
+    /// Repository ID of the selected model, loaded or not.
+    public private(set) var selectedRepoID: String = ModelCatalog.curated.first?.repoID ?? ""
 
     public var loadState: AppModelLoadState = .notLoaded
     public private(set) var loadedRuntimeKey: AppLoadedRuntimeKey?
@@ -74,8 +87,19 @@ public final class AppModel {
                 installer: any AppModelInstallerClient = RepackModelInstallerClient(),
                 memorySampler: AppMemorySampler = AppMemorySampler(),
                 settingsPersistenceEnabled: Bool = false,
-                conversationsPersistenceEnabled: Bool = false) {
-        let directory = (modelDirectory ?? AppModelLocation.defaultURL()).standardizedFileURL
+                conversationsPersistenceEnabled: Bool = false,
+                migratesLegacyInstall: Bool = false) {
+        // Adopt a pre-multi-model install before probing, so an existing model
+        // is found at the new slug path instead of appearing missing.
+        //
+        // Off by default and opted into only by the real app: this moves a
+        // multi-gigabyte directory on the user's disk, and a test run that
+        // constructs an AppModel must never do that.
+        if migratesLegacyInstall, modelDirectory == nil,
+           let curated = ModelCatalog.curated.first {
+            AppModelLocation.migrateLegacyInstallIfNeeded(repoID: curated.repoID)
+        }
+        let directory = (modelDirectory ?? AppModelLocation.curatedDefaultURL()).standardizedFileURL
         let installETAClock = SuspendingClock()
         let settings = settingsPersistenceEnabled
             ? MacAppSettingsFileStore.loadOrCreate(forModelDirectory: directory)
@@ -99,7 +123,32 @@ public final class AppModel {
         self.installETAClock = installETAClock
         self.installETAOrigin = installETAClock.now
         refreshInstallReadiness()
-        loadConversations(forModelDirectory: directory)
+        loadCatalog()
+        loadConversations()
+    }
+
+    /// Support directory holding `catalog.json` and `conversations.json`.
+    /// Derived from the model directory's ancestry so a dev build writing into
+    /// `scratch/models/<slug>/model.gturbo` keeps its state beside the repo
+    /// rather than in Application Support.
+    private var supportDirectory: URL {
+        URL(fileURLWithPath: modelPathText, isDirectory: true)
+            .standardizedFileURL
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+    }
+
+    private func loadCatalog() {
+        let custom = conversationsPersistenceEnabled
+            ? ModelCatalogStore.load(inSupportDirectory: supportDirectory).customEntries
+            : []
+        catalog = ModelCatalog(custom: custom)
+        if case .complete = installationStatus {
+            installStates.setState(
+                .installed(modelDirectory: URL(fileURLWithPath: modelPathText, isDirectory: true)),
+                for: selectedRepoID)
+        }
     }
 
     public var isRunning: Bool { runState == .running }
@@ -360,9 +409,7 @@ public final class AppModel {
         modelPathText = path
         applyPersistedSettings(
             forModelDirectory: URL(fileURLWithPath: path, isDirectory: true))
-        // Conversations are stored per model directory, like settings.
-        loadConversations(
-            forModelDirectory: URL(fileURLWithPath: path, isDirectory: true))
+        loadConversations()
         resetLiveTurn()
         loadGeneration &+= 1
         loadTask?.cancel()
@@ -505,9 +552,12 @@ public final class AppModel {
         installGeneration &+= 1
         let generation = installGeneration
         installState = .checking
+        let entry = selectedEntry
+            ?? ModelCatalogEntry(descriptor: installer.descriptor, trustTier: .curated)
         installTask = Task { [weak self, installer] in
             do {
-                for try await event in installer.installDefaultModel(outputDirectory: outputDirectory) {
+                for try await event in installer.install(entry: entry,
+                                                         outputDirectory: outputDirectory) {
                     guard let self else { return }
                     self.applyInstallEvent(event, generation: generation)
                 }
@@ -524,6 +574,138 @@ public final class AppModel {
         guard canCancelInstall else { return }
         installState = .cancelling
         installer.cancel()
+    }
+
+    // MARK: - Model selection
+
+    public var selectedEntry: ModelCatalogEntry? {
+        catalog.entry(forRepoID: selectedRepoID)
+    }
+
+    /// Descriptor for the model currently being installed or probed.
+    ///
+    /// Must not be `installer.descriptor`: that is the pinned curated model, so
+    /// validating a custom install against it compares the finished download's
+    /// snapshot hash to Gemma's fingerprint and rejects a perfectly good
+    /// install after the user has already waited for the whole transfer.
+    public var descriptorForSelection: AppModelInstallDescriptor {
+        guard let selectedEntry else { return installer.descriptor }
+        return AppModelInstallDescriptor(entry: selectedEntry)
+    }
+
+    /// Resident bytes of the selected model, measured from its manifest when
+    /// installed. Drives the context picker's memory maths.
+    public var residentWeightBytes: UInt64 {
+        AppResidentWeightProbe.residentBytesOrEstimate(
+            atModelDirectory: URL(fileURLWithPath: modelPathText, isDirectory: true))
+    }
+
+    public func switchVerdict(for entry: ModelCatalogEntry) -> ModelSwitchVerdict {
+        ModelSwitchGuard.evaluate(
+            target: entry,
+            currentRepoID: selectedRepoID,
+            loadState: loadState,
+            isGenerating: isRunning,
+            installStates: installStates)
+    }
+
+    /// Switches the loaded model.
+    ///
+    /// Prompt-cache correctness rides on `AppPromptCacheDomain`, which already
+    /// keys on `modelID` and `sourceSnapshotHash`, so an entry cached under the
+    /// previous model cannot match after the switch. The cache itself is
+    /// private to `RealInferenceClient` and is not reachable from here.
+    public func switchModel(to entry: ModelCatalogEntry) {
+        switch switchVerdict(for: entry) {
+        case .alreadyLoaded:
+            return
+        case .blockedByGeneration:
+            error = .generationInFlight
+            return
+        case .busy:
+            return
+        case .notInstalled:
+            selectModel(entry)
+            return
+        case .allowed:
+            break
+        }
+        selectModel(entry)
+        loadModel()
+    }
+
+    /// Repoints state at a model without loading it, so the picker can select
+    /// an uninstalled entry and then download it.
+    private func selectModel(_ entry: ModelCatalogEntry) {
+        guard let directory = try? AppModelLocation.defaultURL(forRepoID: entry.repoID) else {
+            error = .invalidRequest("Invalid repository ID: \(entry.repoID)")
+            return
+        }
+        if loadState.isReady { unloadModel() }
+        selectedRepoID = entry.repoID
+        modelPathText = directory.standardizedFileURL.path
+        installationStatus = AppModelInstallationProbe.status(
+            at: directory,
+            descriptor: AppModelInstallDescriptor(entry: entry))
+        if case .complete = installationStatus {
+            installStates.setState(.installed(modelDirectory: directory), for: entry.repoID)
+        }
+        installState = installStates.state(for: entry.repoID)
+        refreshInstallReadiness()
+    }
+
+    public func startInstall(for entry: ModelCatalogEntry) {
+        selectModel(entry)
+        installModel()
+    }
+
+    /// Removes installed weights but keeps the catalog entry, so the model can
+    /// be re-downloaded without retyping the repository.
+    public func deleteInstall(for entry: ModelCatalogEntry) {
+        guard !(selectedRepoID == entry.repoID && loadState.isReady) else {
+            error = .invalidRequest("Unload \(entry.displayName) before deleting it.")
+            return
+        }
+        guard let directory = try? AppModelLocation.defaultURL(forRepoID: entry.repoID) else {
+            return
+        }
+        // Removes the slug directory, not just model.gturbo, so a partial
+        // install's staging files go with it.
+        // Only the weights directory. The slug directory also holds this
+        // model's settings and the install lock, and removing it wholesale
+        // destroyed unrelated state — and could fail partway on the held lock
+        // while having already deleted the weights.
+        do {
+            try FileManager.default.removeItem(at: directory)
+        } catch {
+            // Never silent: losing weights is the most expensive thing this app
+            // can do to a user, so a failure has to be visible.
+            self.error = .invalidRequest(
+                "Could not delete \(entry.displayName): \(error.localizedDescription)")
+            return
+        }
+        installStates.setState(.idle, for: entry.repoID)
+        if selectedRepoID == entry.repoID {
+            installState = .idle
+            installationStatus = AppModelInstallationProbe.status(
+                at: directory,
+                descriptor: AppModelInstallDescriptor(entry: entry))
+            refreshInstallReadiness()
+        }
+    }
+
+    /// Adds a user-supplied repository after the caller has run the
+    /// architecture pre-flight and obtained consent.
+    @discardableResult
+    public func addCustomModel(_ entry: ModelCatalogEntry) -> Bool {
+        guard let updated = try? catalog.addingCustom(entry) else { return false }
+        catalog = updated
+        if conversationsPersistenceEnabled {
+            try? ModelCatalogStore.save(
+                ModelCatalogFile(customEntries: updated.customEntries),
+                inSupportDirectory: supportDirectory)
+        }
+        return true
     }
 
     public var hasPartialModelDownload: Bool {
@@ -573,7 +755,7 @@ public final class AppModel {
     private func refreshInstallReadiness(at outputDirectory: URL) {
         installationStatus = AppModelInstallationProbe.status(
             at: outputDirectory,
-            descriptor: installer.descriptor)
+            descriptor: descriptorForSelection)
         guard !isModelInstalled else { return }
         installReadiness = .checking
         do {
@@ -622,7 +804,7 @@ public final class AppModel {
             let directory = directory.standardizedFileURL
             installationStatus = AppModelInstallationProbe.status(
                 at: directory,
-                descriptor: installer.descriptor)
+                descriptor: descriptorForSelection)
             guard installationStatus == .complete else {
                 finishInstallFailure(
                     RepackError.configurationInvalid(detail: "completed install did not pass metadata validation"),
@@ -841,9 +1023,12 @@ public final class AppModel {
         isContextOverflowNoticeVisible = false
     }
 
-    private func loadConversations(forModelDirectory modelDirectory: URL) {
+    /// Conversations live in one global store rather than inside a model
+    /// directory: history has to survive a model switch, and deleting a model
+    /// must not delete the chats made with it.
+    private func loadConversations() {
         let store = conversationsPersistenceEnabled
-            ? ConversationFileStore.load(forModelDirectory: modelDirectory)
+            ? ConversationFileStore.loadGlobal(inSupportDirectory: supportDirectory)
             : ConversationStoreFile()
         conversations = store.conversations
         if conversations.isEmpty {
@@ -855,8 +1040,7 @@ public final class AppModel {
     private func persistConversations() {
         guard conversationsPersistenceEnabled else { return }
         let store = ConversationStoreFile(conversations: conversations)
-        let modelDirectory = URL(fileURLWithPath: modelPathText, isDirectory: true)
-        try? ConversationFileStore.save(store, forModelDirectory: modelDirectory)
+        try? ConversationFileStore.saveGlobal(store, inSupportDirectory: supportDirectory)
     }
 
     /// Commits the finished exchange. Both turns land together so the committed
