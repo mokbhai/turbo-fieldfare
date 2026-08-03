@@ -135,7 +135,7 @@ import Testing
         }
 
         #expect(!model.isRunning)
-        #expect(model.outputConversationPlainText.contains("alpha beta"))
+        #expect(model.viewedConversationPlainText.contains("alpha beta"))
         #expect(model.diagnostics != nil)
         #expect(model.error == nil)
     }
@@ -151,7 +151,7 @@ import Testing
         #expect(model.outputPromptText == "original prompt")
         #expect(model.hasOutputTranscript)
         #expect(model.outputResponsePlainText.isEmpty)
-        #expect(model.outputConversationPlainText == "You:\noriginal prompt")
+        #expect(model.viewedConversationPlainText == "You:\noriginal prompt")
 
         model.promptText = "edited prompt"
         await waitForIdle(model)
@@ -159,9 +159,9 @@ import Testing
         // A completed exchange moves from the live turn into committed history.
         #expect(model.outputPromptText.isEmpty)
         #expect(model.committedTurns.map(\.content) == ["original prompt", "answer"])
-        #expect(model.outputConversationPlainText
+        #expect(model.viewedConversationPlainText
             == "You:\noriginal prompt\n\nAnswer:\nanswer")
-        #expect(!model.outputConversationPlainText.contains("edited prompt"))
+        #expect(!model.viewedConversationPlainText.contains("edited prompt"))
     }
 
     @MainActor
@@ -180,7 +180,7 @@ import Testing
 
         #expect(model.promptText.isEmpty)
         #expect(model.outputPromptText == "original prompt")
-        #expect(model.outputConversationPlainText == "You:\noriginal prompt")
+        #expect(model.viewedConversationPlainText == "You:\noriginal prompt")
 
         // A prompt typed while the answer streams must survive the terminal event.
         model.promptText = "next prompt"
@@ -521,7 +521,7 @@ import Testing
         #expect(model.error == .cancelled)
         #expect(model.hasOutputTranscript)
         #expect(!model.outputResponsePlainText.isEmpty)
-        #expect(model.outputConversationPlainText.hasPrefix(
+        #expect(model.viewedConversationPlainText.hasPrefix(
             "You:\nstop after token\n\nAnswer:\n"))
 
         model.clearOutput()
@@ -529,7 +529,7 @@ import Testing
         #expect(model.outputPromptText.isEmpty)
         #expect(model.outputText.isEmpty)
         #expect(model.outputResponsePlainText.isEmpty)
-        #expect(model.outputConversationPlainText.isEmpty)
+        #expect(model.viewedConversationPlainText.isEmpty)
         #expect(model.error == nil)
     }
 
@@ -553,7 +553,7 @@ import Testing
         #expect(model.outputPromptText == "prefill prompt")
         #expect(model.outputText.isEmpty)
         #expect(model.outputResponsePlainText.isEmpty)
-        #expect(model.outputConversationPlainText == "You:\nprefill prompt")
+        #expect(model.viewedConversationPlainText == "You:\nprefill prompt")
         #expect(model.hasOutputTranscript)
 
         model.clearOutput()

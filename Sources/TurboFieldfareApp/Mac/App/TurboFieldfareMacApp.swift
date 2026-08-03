@@ -48,7 +48,6 @@ struct TurboFieldfareMacApp: App {
             CommandGroup(replacing: .newItem) {
                 Button("New Chat", action: model.newConversation)
                     .keyboardShortcut("n", modifiers: .command)
-                    .disabled(model.isRunning)
             }
             CommandGroup(after: .toolbar) {
                 Button("Toggle Sidebar") {

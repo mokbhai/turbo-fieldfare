@@ -131,11 +131,17 @@ public final class AppModel {
     private var installGeneration: UInt64 = 0
     private var pendingExplicitLoadRuntimeKey: AppLoadedRuntimeKey?
     private var activeRunRuntimeKey: AppLoadedRuntimeKey?
-    /// The conversation that owns the run in flight, captured when the request
-    /// is accepted. A cancelled or failed run gives its prompt and its error
-    /// back to the conversation that started it, not to whichever conversation
-    /// happens to be on screen when the run ends.
-    private var runConversationID: UUID?
+    /// The conversation the live turn belongs to, pinned when the request is
+    /// accepted. Switching chats moves the viewport and nothing else, so without
+    /// this pin the answer would commit to whichever conversation happened to be
+    /// on screen when generation ended, and a cancelled or failed run would give
+    /// its prompt and its banner to a stranger.
+    ///
+    /// Deliberately outlives `runState`: a cancelled or failed run leaves its
+    /// partial turn on screen, and that turn still belongs to one chat. It is
+    /// cleared only when the turn is committed, discarded, or replaced by the
+    /// next `run()`.
+    private(set) var liveTurnConversationID: UUID?
     private var hasHandledTerminalEvent = false
     private let memorySampler: AppMemorySampler
     private let settingsPersistenceEnabled: Bool
@@ -330,8 +336,44 @@ public final class AppModel {
 
     public var canCancel: Bool { isRunning && !isCancellationPending }
 
+    /// The conversation generating right now, or nil when nothing is running.
+    public var generatingConversationID: UUID? {
+        isRunning ? liveTurnConversationID : nil
+    }
+
+    /// Non-optional on purpose: comparing `generatingConversationID` against an
+    /// optional would report a match when both sides are nil, marking every row
+    /// in the sidebar as generating while the app sits idle.
+    public func isGenerating(_ id: UUID) -> Bool {
+        generatingConversationID == id
+    }
+
+    /// True only when the run in flight belongs to the conversation on screen.
+    /// The Stop pill, the composer's clear actions and the examples card key off
+    /// this; the HUD and the model-lifecycle locks stay on the global
+    /// `isRunning`, because they describe the machine rather than the document.
+    public var isRunningInActiveConversation: Bool {
+        isRunning && liveTurnConversationID == activeConversationID
+    }
+
+    /// Whether the live turn belongs to the conversation on screen. Unlike
+    /// `isRunningInActiveConversation` this stays true after a cancelled or
+    /// failed run, because that partial turn stays on screen for its own chat.
+    private var isLiveTurnVisible: Bool {
+        liveTurnConversationID != nil && liveTurnConversationID == activeConversationID
+    }
+
+    /// The live turn's conversation has been deleted, so the turn has nowhere to
+    /// land. Reachable in normal use because deleting a generating conversation
+    /// cancels the run and removes the row before the terminal event arrives.
+    private var isLiveTurnOwnerMissing: Bool {
+        guard let liveTurnConversationID else { return false }
+        return !conversations.contains(where: { $0.id == liveTurnConversationID })
+    }
+
     public var hasOutputTranscript: Bool {
-        !committedTurns.isEmpty || !outputPromptText.isEmpty || !outputText.isEmpty
+        !committedTurns.isEmpty || !viewedOutputPromptText.isEmpty
+            || !viewedOutputText.isEmpty
     }
 
     /// Whether the prompt-examples card belongs on screen.
@@ -349,29 +391,63 @@ public final class AppModel {
     /// states are not fresh, and `clearOutput()` or a new conversation is what
     /// makes them fresh again.
     ///
-    /// `isRunning` is a belt-and-braces clause, not a discriminator: `run()`
-    /// assigns `outputPromptText` before it marks the run running, so
+    /// The run clause is belt-and-braces, not a discriminator: `run()` assigns
+    /// `outputPromptText` before it marks the run running, so
     /// `hasOutputTranscript` is already true for every instant of a run. It is
     /// kept because that equivalence rests on `latestUserContent` finding a user
     /// message, and `run()` falls back to `""` when it does not — under that
-    /// fallback `isRunning` is the only thing left holding the card off screen.
+    /// fallback it is the only thing left holding the card off screen.
+    ///
+    /// Both clauses are scoped to the conversation on screen, and they have to
+    /// move together. `hasOutputTranscript` ignores a live turn owned by another
+    /// chat, so a global `isRunning` here would be the sole reason a genuinely
+    /// fresh chat opened during a background run hid its card.
     public var isPromptExamplesCardVisible: Bool {
-        promptText.isEmpty && !hasOutputTranscript && !isRunning
+        promptText.isEmpty && !hasOutputTranscript && !isRunningInActiveConversation
     }
 
     public var outputResponsePlainText: String {
         generationTranscriptMailbox?.completeText ?? outputText
     }
 
-    public var outputConversationPlainText: String {
+    /// The live turn as the conversation on screen sees it: empty whenever the
+    /// turn belongs to another chat, so a background run never bleeds into the
+    /// transcript, the placeholder, or the copy actions of the chat being read.
+    public var viewedOutputPromptText: String {
+        isLiveTurnVisible ? outputPromptText : ""
+    }
+
+    public var viewedOutputText: String {
+        isLiveTurnVisible ? outputText : ""
+    }
+
+    public var viewedResponsePlainText: String {
+        isLiveTurnVisible ? outputResponsePlainText : ""
+    }
+
+    /// Nil unless the live turn is on screen. Load-bearing: the transcript view
+    /// drains this mailbox on a repeating timer of its own, outside SwiftUI's
+    /// observation graph, so handing a non-owning chat a non-nil mailbox would
+    /// stream another conversation's tokens into it regardless of any other
+    /// guard.
+    public var viewedTranscriptMailbox: GenerationTranscriptMailbox? {
+        isLiveTurnVisible ? generationTranscriptMailbox : nil
+    }
+
+
+    public var viewedConversationPlainText: String {
+        conversationPlainText(prompt: viewedOutputPromptText,
+                              response: viewedResponsePlainText)
+    }
+
+    private func conversationPlainText(prompt: String, response: String) -> String {
         var sections: [String] = []
         for turn in committedTurns {
             sections.append(turn.role == .user
                 ? "You:\n\(turn.content)"
                 : "Answer:\n\(turn.content)")
         }
-        if !outputPromptText.isEmpty { sections.append("You:\n\(outputPromptText)") }
-        let response = outputResponsePlainText
+        if !prompt.isEmpty { sections.append("You:\n\(prompt)") }
         if !response.isEmpty { sections.append("Answer:\n\(response)") }
         return sections.joined(separator: "\n\n")
     }
@@ -1059,10 +1135,19 @@ public final class AppModel {
     }
 
     public func newConversation() {
-        guard !isRunning else { return }
+        // A live turn is this action's to discard only when the chat being left
+        // owns it and nothing is in flight. One owned by another chat, or by a
+        // run still streaming, has to survive.
+        let discardsLiveTurn = !isRunning
+            && (liveTurnConversationID == nil
+                || liveTurnConversationID == activeConversationID)
         // Never accumulate empty chats: reuse the active one if it is untouched.
-        if let active = activeConversation, active.isEmpty {
-            resetLiveTurn()
+        // A chat generating right now has no committed turns either, so
+        // `isEmpty` alone would reuse the very conversation the answer is bound
+        // for and hand it to a new exchange.
+        if let active = activeConversation, active.isEmpty,
+           generatingConversationID != active.id {
+            if discardsLiveTurn { resetLiveTurn() }
             // Reuse means this is also the "Clear output" path, which has to
             // clear the banner of the conversation it is emptying. The fresh
             // branch below cannot need it: a new id has no failure yet.
@@ -1071,36 +1156,75 @@ public final class AppModel {
         }
         let conversation = Conversation()
         conversations.append(conversation)
-        activeConversationID = conversation.id
-        resetLiveTurn()
+        setActiveConversation(conversation.id)
+        if discardsLiveTurn { resetLiveTurn() }
         persistConversations()
     }
 
+    /// Switching conversations moves the viewport and nothing else. It must not
+    /// touch the live turn: a run started elsewhere keeps streaming, and its
+    /// prompt and partial answer have to be intact when the user comes back.
     public func selectConversation(_ id: UUID) {
-        guard !isRunning, id != activeConversationID,
+        guard id != activeConversationID,
               conversations.contains(where: { $0.id == id }) else { return }
+        setActiveConversation(id)
+    }
+
+    /// The single door onto `activeConversationID`. Every path that changes
+    /// which conversation is on screen — selecting, starting a new chat,
+    /// deleting the one being read, restoring at launch — goes through here, so
+    /// arrival-time work cannot be implemented by one of them and forgotten by
+    /// the rest.
+    ///
+    /// What belongs here is state describing the chat being *read*, as opposed
+    /// to the run. `resetLiveTurn()` used to do this job by being called from
+    /// every switch, which also destroyed the live turn; the turn now follows
+    /// its owner, so only the viewer-scoped part is left to clear. Drafts and
+    /// run failures need nothing here at all — they are already stored per
+    /// conversation, so a switch simply reads a different entry.
+    private func setActiveConversation(_ id: UUID?) {
+        guard id != activeConversationID else { return }
         activeConversationID = id
-        resetLiveTurn()
+        // "This chat has filled the … context" is a statement about the chat in
+        // front of the user and about a send they just made in it. Carried
+        // across a switch it accuses a conversation that may be empty. The next
+        // send in the full chat raises it again, so clearing loses nothing.
+        isContextOverflowNoticeVisible = false
     }
 
     public func deleteConversation(_ id: UUID) {
-        guard !isRunning, let index = conversations.firstIndex(where: { $0.id == id }) else {
+        guard let index = conversations.firstIndex(where: { $0.id == id }) else {
             return
         }
+        // Cancel first, never refuse: leaving a chat undeletable for the length
+        // of a 26B generation is worse than stopping a reply the user has just
+        // asked to throw away. `cancel()` only requests cancellation, so the
+        // terminal event lands after the row is gone — the terminal handler
+        // detects the missing owner and discards the orphaned turn rather than
+        // appending it to whichever conversation is active by then.
+        if id == generatingConversationID { cancel() }
+        let removesLiveTurnOwner = id == liveTurnConversationID
         conversations.remove(at: index)
         // The conversation is gone and can never be selected again, so its
         // draft and its failure go with it rather than sitting in memory.
         drafts[id] = nil
         conversationErrors[id] = nil
         if activeConversationID == id {
-            activeConversationID = conversationsByRecency.first?.id
-            resetLiveTurn()
+            setActiveConversation(conversationsByRecency.first?.id)
         }
         if conversations.isEmpty {
             let conversation = Conversation()
             conversations.append(conversation)
-            activeConversationID = conversation.id
+            setActiveConversation(conversation.id)
         }
+        // A live turn goes with its conversation, but only once no run is
+        // writing to it: while one is, `liveTurnConversationID` keeps pointing
+        // at the departed UUID so the terminal handler can tell it is orphaned.
+        // `clearLiveTurn`, not `resetLiveTurn`: the latter also drops
+        // `diagnostics` and the context-overflow notice, and neither of those
+        // belonged to the deleted conversation. Removing a chat must not blank
+        // the HUD's account of the last run.
+        if removesLiveTurnOwner && !isRunning { clearLiveTurn() }
         persistConversations()
     }
 
@@ -1118,15 +1242,29 @@ public final class AppModel {
         persistConversations()
     }
 
-    /// Discards the live turn. Says nothing about errors: a conversation's
-    /// failure belongs to that conversation and outlives a switch, so the
-    /// callers that really are clearing a conversation say so themselves.
+    /// Throws away everything the chat being left had to show, live turn
+    /// included. Only reachable from an explicit user action on the turn's own
+    /// conversation — New Chat, Clear, or deleting the owner — and no longer
+    /// from a plain switch, which must leave the run alone. What a switch still
+    /// owes is in `setActiveConversation`.
+    ///
+    /// Says nothing about errors: a conversation's failure belongs to that
+    /// conversation and outlives a switch, so the callers that really are
+    /// clearing a conversation say so themselves.
     private func resetLiveTurn() {
+        clearLiveTurn()
+        diagnostics = nil
+        isContextOverflowNoticeVisible = false
+    }
+
+    /// Drops the live turn and its ownership. Separate from `resetLiveTurn` so a
+    /// terminal handler can dispose of an orphaned turn without also wiping the
+    /// diagnostics that describe the run itself.
+    private func clearLiveTurn() {
         outputPromptText = ""
         outputText = ""
         generationTranscriptMailbox?.reset()
-        diagnostics = nil
-        isContextOverflowNoticeVisible = false
+        liveTurnConversationID = nil
     }
 
     public func dismissContextOverflowNotice() {
@@ -1182,7 +1320,7 @@ public final class AppModel {
         // never be reachable or released again.
         let liveIDs = Set(conversations.map(\.id))
         drafts = drafts.filter { liveIDs.contains($0.key) }
-        activeConversationID = conversationsByRecency.first?.id
+        setActiveConversation(conversationsByRecency.first?.id)
     }
 
     private func persistConversations() {
@@ -1195,10 +1333,34 @@ public final class AppModel {
     /// list is never half-written, and only here does the store get touched —
     /// writing per token would thrash the disk at decode speed.
     private func commitLiveTurn() {
-        guard let index = conversations.firstIndex(where: { $0.id == activeConversationID })
-        else { return }
         let response = outputResponsePlainText
         guard !outputPromptText.isEmpty || !response.isEmpty else { return }
+        // Resolved against the conversation the run started in, never the one on
+        // screen and never a stored index: the user may have switched — or
+        // deleted another chat, moving every index — while the answer streamed.
+        guard let owner = liveTurnConversationID,
+              let index = conversations.firstIndex(where: { $0.id == owner })
+        else {
+            // The owning conversation was deleted mid-run. Nothing can be
+            // committed, and leaving the text in place would let it be appended
+            // to whichever conversation commits next.
+            clearLiveTurn()
+            return
+        }
+        // An answer is what makes a turn history. A run that ended before its
+        // first token leaves a prompt and nothing else, and committing that
+        // would write a user message the model never replied to: the transcript
+        // would show a question hanging in silence, and `makeRequest` would put
+        // two user messages in a row into the next request — a shape the pinned
+        // IT chat template renders but the checkpoint was never tuned on, and
+        // one that compounds with every failure. Nothing is lost by refusing:
+        // the prompt goes back to its own conversation's draft, armed for a
+        // retry where the user typed it.
+        guard !response.isEmpty else {
+            restoreSubmittedPromptIfComposerIsEmpty()
+            clearLiveTurn()
+            return
+        }
         let now = Date()
         if !outputPromptText.isEmpty {
             conversations[index].turns.append(
@@ -1211,9 +1373,7 @@ public final class AppModel {
         conversations[index].lastPromptTokenCount = diagnostics?.promptTokenCount
         conversations[index].updatedAt = now
         conversations[index].retitleIfNeeded()
-        outputPromptText = ""
-        outputText = ""
-        generationTranscriptMailbox?.reset()
+        clearLiveTurn()
         persistConversations()
     }
 
@@ -1241,19 +1401,20 @@ public final class AppModel {
         persistSettings()
 
         generationTranscriptMailbox?.reset()
+        // Pinned here, beside the prompt snapshot: from this instant the live
+        // turn belongs to this conversation, whatever the user switches to while
+        // it streams.
+        liveTurnConversationID = activeConversationID
         outputPromptText = request.latestUserContent ?? ""
         // The request is accepted from here on; see `promptText` for why the
         // composer is cleared here and nowhere else.
         promptText = ""
         outputText = ""
         diagnostics = nil
-        // Whose run this is, for the terminal paths that have to give the prompt
-        // and any failure back to the conversation that started it.
-        runConversationID = activeConversationID
         // A fresh send clears the banner: this conversation's own last failure
         // is what is being retried, and a global one the user has since worked
         // past should not sit over the answer they just asked for.
-        setRunError(nil, for: runConversationID)
+        setRunError(nil, for: liveTurnConversationID)
         setGlobalError(nil)
         hasHandledTerminalEvent = false
         activeRunRuntimeKey = AppLoadedRuntimeKey(
@@ -1353,8 +1514,7 @@ public final class AppModel {
         hasHandledTerminalEvent = true
         materializeServiceTranscript()
         self.diagnostics = diagnostics
-        setRunError(.cancelled, for: runOwnerConversationID)
-        restoreSubmittedPromptIfComposerIsEmpty()
+        settleUncommittedLiveTurn(.cancelled)
         finishTerminalRun()
     }
 
@@ -1362,7 +1522,29 @@ public final class AppModel {
     /// screen only when no run was recorded, which happens when a caller drives
     /// `apply` directly rather than through `run()`.
     private var runOwnerConversationID: UUID? {
-        runConversationID ?? activeConversationID
+        liveTurnConversationID ?? activeConversationID
+    }
+
+    /// Disposes of a live turn that no terminal path committed.
+    ///
+    /// Normally that means recording the failure against the conversation that
+    /// asked for the run and putting its prompt back into that conversation's
+    /// own draft, so both are waiting where the user left them however far they
+    /// have wandered since. Nothing is deferred and nothing is handed over on
+    /// arrival: per-conversation drafts and errors make the delivery final at
+    /// the moment the run ends.
+    ///
+    /// When the owning conversation was deleted mid-run there is nobody to tell
+    /// and nowhere to put the turn. A banner keyed to a conversation that no
+    /// longer exists could never be read or dismissed, and leaving the text in
+    /// place would let the next commit inherit it, so the turn simply goes.
+    private func settleUncommittedLiveTurn(_ appError: AppInferenceError) {
+        guard !isLiveTurnOwnerMissing else {
+            clearLiveTurn()
+            return
+        }
+        setRunError(appError, for: runOwnerConversationID)
+        restoreSubmittedPromptIfComposerIsEmpty()
     }
 
     /// Puts the submitted prompt back in the composer after a terminal path that
@@ -1384,11 +1566,13 @@ public final class AppModel {
     /// a stray space the user tapped mid-stream has nothing worth keeping, and
     /// treating it as occupied would discard the submitted prompt instead.
     ///
-    /// The restore targets the conversation that started the run, not the
-    /// composer on screen: the prompt is that conversation's, and writing it
-    /// anywhere else would hand one chat's text to another.
+    /// Both the target and the text come from the live turn's owner. Reading the
+    /// text from `outputPromptText` while resolving the target some other way
+    /// would copy one chat's prompt into another chat's draft the moment the two
+    /// disagreed — the very misdelivery the pin exists to prevent, arriving by
+    /// the back door. With no live turn there is nothing to restore.
     private func restoreSubmittedPromptIfComposerIsEmpty() {
-        guard let owner = runOwnerConversationID else { return }
+        guard let owner = liveTurnConversationID else { return }
         let draft = drafts[owner] ?? ""
         guard draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         drafts[owner] = outputPromptText.isEmpty ? nil : outputPromptText
@@ -1404,8 +1588,7 @@ public final class AppModel {
         hasHandledTerminalEvent = true
         // The run failed, not the app: the failure belongs to the conversation
         // that asked for it, and no other conversation's banner is touched.
-        setRunError(appError, for: runOwnerConversationID)
-        restoreSubmittedPromptIfComposerIsEmpty()
+        settleUncommittedLiveTurn(appError)
         finishTerminalRun()
     }
 
@@ -1419,7 +1602,9 @@ public final class AppModel {
         runState = .idle
         isCancellationPending = false
         activeRunRuntimeKey = nil
-        runConversationID = nil
+        // `liveTurnConversationID` is deliberately not cleared here: a cancelled
+        // or failed run leaves its partial turn on screen, and that turn is
+        // still one conversation's.
         runTask = nil
     }
 

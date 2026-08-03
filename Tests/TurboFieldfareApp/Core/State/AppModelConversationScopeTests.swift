@@ -49,7 +49,7 @@ import Testing
         model.run()
         await waitForIdle(model)
         #expect(model.committedTurns.map(\.content) == ["second chat question", "answer"])
-        #expect(!model.outputConversationPlainText.contains("draft for the first chat"))
+        #expect(!model.viewedConversationPlainText.contains("draft for the first chat"))
 
         model.selectConversation(first)
         #expect(model.promptText == "draft for the first chat")

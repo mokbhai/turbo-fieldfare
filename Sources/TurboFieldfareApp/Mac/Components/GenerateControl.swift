@@ -7,11 +7,27 @@ struct GenerateControl: View {
     private let controlHeight: CGFloat = 34
 
     var body: some View {
-        if model.isRunning {
+        if model.isRunningInActiveConversation {
             runningPill
         } else {
+            // A run owned by another conversation shows the disabled Generate
+            // button, never a Stop pill: the pill carries `.cancelAction`, so
+            // putting it here would arm Escape against a generation the user
+            // cannot even see.
             generateButton
         }
+    }
+
+    /// Nil unless a *different* conversation is generating.
+    private var generatingElsewhereTitle: String? {
+        guard let id = model.generatingConversationID,
+              id != model.activeConversationID else { return nil }
+        return model.conversations.first(where: { $0.id == id })?.title
+    }
+
+    private var generateHelp: String {
+        guard let title = generatingElsewhereTitle else { return "Generate" }
+        return "A reply is still generating in “\(title)”"
     }
 
     private var generateButton: some View {
@@ -33,6 +49,7 @@ struct GenerateControl: View {
         .keyboardShortcut(.return, modifiers: .command)
         .disabled(!model.canRun)
         .opacity(model.canRun ? 1 : 0.62)
+        .help(generateHelp)
     }
 
     private var runningPill: some View {
