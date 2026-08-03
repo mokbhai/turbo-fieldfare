@@ -160,4 +160,130 @@ import Metal
         #expect(kv.position == 1)
     }
 
+    /// The bound is a rewind *distance*, not an absolute cursor: a ring holding
+    /// its window `W` in capacity `C` has `C - W` tokens of slack, and it has
+    /// that slack however far past `C` the cursor has run.
+    @Test func rewindOfExactlyTheRingSlackIsAllowedLongAfterWrapping() throws {
+        let (_, kv) = try makeManager(maxContext: 4096,
+                                      fp16RingEnabled: true)
+        let slack = kv.capacity(layer: 0) - config.slidingWindow  // 1152 - 1024
+        #expect(slack == 128)
+        // Well past the ring capacity — the old absolute bound refused this
+        // outright, which is exactly where prompt reuse matters most.
+        kv.advance(by: 3000)
+
+        #expect(kv.canRewind(to: 3000 - slack))
+        kv.rewind(to: 3000 - slack)
+        #expect(kv.position == 3000 - slack)
+        kv.advance(by: slack)
+        #expect(kv.position == 3000)
+    }
+
+    /// One token past `C - W` is refused. Residency would in fact still hold
+    /// there — the true maximum is `C - W + 1` — so this pins the margin the
+    /// bound keeps on purpose, not the point where the ring runs out.
+    @Test func rewindOneTokenPastTheRingSlackIsRefused() throws {
+        let (_, kv) = try makeManager(maxContext: 4096,
+                                      fp16RingEnabled: true)
+        let slack = kv.capacity(layer: 0) - config.slidingWindow
+        kv.advance(by: 3000)
+
+        #expect(!kv.canRewind(to: 3000 - slack - 1))
+    }
+
+    /// A ring too small to hold its own window has no slack at all, so every
+    /// rewind that actually *moves* the cursor fails closed rather than silently
+    /// attending over evicted slots. The no-op rewind stays legal.
+    @Test func rewindIsRefusedWhenTheRingCannotHoldItsWindow() throws {
+        let (_, kv) = try makeManager(maxContext: 4096,
+                                      fp16RingEnabled: true,
+                                      fp16RingCapacityOverride: 8)
+        #expect(kv.capacity(layer: 0) - config.slidingWindow < 0)
+        kv.advance(by: 20)
+
+        #expect(!kv.canRewind(to: 19))
+        #expect(!kv.canRewind(to: 0))
+        // But the zero-distance rewind stays legal even here. It moves nothing,
+        // so nothing can be evicted by it; refusing it would make `rewind` trip
+        // its own precondition and abort the process on a plain no-op.
+        #expect(kv.canRewind(to: 20))
+        kv.rewind(to: 20)
+        #expect(kv.position == 20)
+    }
+
+    /// Ring off, every layer sized for the whole context: nothing can wrap, so
+    /// no distance limit applies.
+    @Test func rewindIsUnboundedWhenNoLayerCanWrap() throws {
+        let (_, kv) = try makeManager(maxContext: 256)
+        kv.advance(by: 200)
+
+        #expect(kv.canRewind(to: 0))
+        kv.rewind(to: 1)
+        #expect(kv.position == 1)
+    }
+
+    /// The arithmetic tests above would pass for any bound of the same shape.
+    /// This one reads the ring itself: it stamps every position with its own
+    /// index, rewinds by the permitted slack, and checks that each slot the
+    /// re-prefill's attention window would touch still answers with the logical
+    /// position it claims. A bound one token too loose evicts the oldest such
+    /// slot, and the marker there comes back as a *different* position — which
+    /// is exactly the corruption `canRewind` exists to prevent.
+    ///
+    /// No model and no kernels: markers stand in for K vectors, written through
+    /// the manager's own `kSlot`, so the ring's real address arithmetic is under
+    /// test.
+    @Test func rewindOfThePermittedSlackLeavesTheWholeAttentionWindowResident() throws {
+        let (_, kv) = try makeManager(maxContext: 4096, fp16RingEnabled: true)
+        let capacity = kv.capacity(layer: 0)          // 1152, the SWA ring
+        let window = config.slidingWindow             // 1024
+        let cursor = 3000                             // well past one wrap
+        for position in 0..<cursor {
+            writeMarker(kv, layer: 0, position: position)
+        }
+        kv.advance(by: cursor)
+
+        // Rewind as far as the manager itself will go, rather than by a
+        // hardcoded slack: probing is what makes the residency check below bite
+        // on a bound that is too loose instead of quietly agreeing with it.
+        var permitted = 0
+        while kv.canRewind(to: cursor - (permitted + 1)) { permitted += 1 }
+        // `C - W`, one token inside the true maximum `C - W + 1`. That last
+        // token is refused on purpose, not because residency fails there.
+        #expect(permitted == capacity - window)       // 128
+
+        kv.rewind(to: cursor - permitted)
+
+        // Re-prefilling queries `[position, cursor)` reads keys back to
+        // `position - W + 1`; everything from there up must survive.
+        let oldestKeyRead = kv.position - window + 1
+        var stale: [Int] = []
+        for position in oldestKeyRead..<cursor
+        where readMarker(kv, layer: 0, position: position) != Int32(position) {
+            stale.append(position)
+        }
+        #expect(stale.isEmpty, "evicted slots inside the re-prefill window: \(stale.prefix(8))")
+
+        // And the test can tell a wrong bound from a right one: two tokens past
+        // the permitted slack the window reaches a slot the ring really has
+        // recycled, and it answers with the newer position that overwrote it.
+        let evicted = oldestKeyRead - 2
+        #expect(readMarker(kv, layer: 0, position: evicted) == Int32(evicted + capacity))
+    }
+
+    /// Stamp a slot with its own logical position. Only the first four bytes of
+    /// the token's stride are used; residency is about *which* position owns the
+    /// slot, not about the vector's contents.
+    private func writeMarker(_ kv: KVCacheManager, layer: Int, position: Int) {
+        let slot = kv.kSlot(layer: layer, position: position)
+        slot.buffer.contents().advanced(by: slot.offset)
+            .assumingMemoryBound(to: Int32.self).pointee = Int32(position)
+    }
+
+    private func readMarker(_ kv: KVCacheManager, layer: Int, position: Int) -> Int32 {
+        let slot = kv.kSlot(layer: layer, position: position)
+        return slot.buffer.contents().advanced(by: slot.offset)
+            .assumingMemoryBound(to: Int32.self).pointee
+    }
+
 }

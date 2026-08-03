@@ -98,12 +98,20 @@ struct ServerPromptCache: Sendable {
             return .miss
         }
 
-        if renderedPromptIDs.count > entry.kvPosition,
-           renderedPromptIDs.prefix(entry.kvPosition)
-            .elementsEqual(entry.kvBackedTokenIDs) {
+        let shared = min(renderedPromptIDs.count, entry.kvPosition)
+        // When the whole rendered prompt is already in the KV — an identical
+        // resubmission — the resume must still leave one token to prefill,
+        // because a completion needs logits to sample from and
+        // `runRawCompletion` rejects a cached count equal to the prompt.
+        // Guarding on the reusable count rather than on `shared` is what keeps a
+        // prompt that merely extends a one-token KV a hit.
+        let cached = shared == renderedPromptIDs.count ? shared - 1 : shared
+        if cached > 0,
+           renderedPromptIDs.prefix(shared)
+            .elementsEqual(entry.kvBackedTokenIDs.prefix(shared)) {
             return .hit(
                 effectivePromptIDs: renderedPromptIDs,
-                cachedPromptTokens: entry.kvPosition)
+                cachedPromptTokens: cached)
         }
 
         let inputCount = entry.inputMessages.count
@@ -202,5 +210,48 @@ struct ServerPromptCache: Sendable {
         return .hit(
             effectivePromptIDs: entry.kvBackedTokenIDs + bridge,
             cachedPromptTokens: entry.kvPosition)
+    }
+}
+
+/// How a matched prefix turns into the start of one completion.
+///
+/// This is deliberately separate from `ServerModelSession`, which cannot be
+/// built without the real checkpoint: the branch that matters most here is a hit
+/// the KV can no longer reach, and that fallback is the only thing between a
+/// refused rewind and a failed request.
+enum ServerPromptCacheDecision {
+    struct Resolution: Sendable, Equatable {
+        let effectivePromptIDs: [Int32]
+        let start: RawCompletionStart
+        /// Whether the caller must drop the retained entry. An entry that
+        /// survived a reset would describe a KV prefix the next request can no
+        /// longer resume onto.
+        let invalidatesCache: Bool
+    }
+
+    /// `canResume` is a probe, not a command: it is asked only about a count the
+    /// match already produced, so the caller never commits to a resume it cannot
+    /// perform.
+    static func resolve(
+        match: ServerPromptCacheMatch,
+        canResume: (Int) -> Bool,
+        promptIDs: [Int32]
+    ) -> Resolution {
+        let fallback = Resolution(
+            effectivePromptIDs: promptIDs,
+            start: .reset,
+            invalidatesCache: true)
+        guard case .hit(let effective, let cached) = match else { return fallback }
+        // The KV can no longer reach the resume point once its ring has wrapped
+        // past it. Rebuilding the prefix costs time; failing the request costs
+        // the answer.
+        guard canResume(cached) else { return fallback }
+        // `match` verified the cached count against the KV's own token IDs, so a
+        // count short of the cursor is a genuine prefix and the rewind onto it
+        // is sound.
+        return Resolution(
+            effectivePromptIDs: effective,
+            start: .resume(cachedPromptTokens: cached, allowingRewind: true),
+            invalidatesCache: false)
     }
 }

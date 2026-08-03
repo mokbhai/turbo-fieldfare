@@ -98,6 +98,24 @@ server reuses the verified KV prefix and reports the number of reused tokens in:
 usage.prompt_tokens_details.cached_tokens
 ```
 
+Resending an identical history — or any render shorter than what the KV already
+holds — ends behind the retained cursor, so the cursor moves back over the
+tokens in between. That works only while the cursor moves back no further than
+the FP16 KV ring's spare room. The ring holds
+`min(--max-context, sliding window + prefill chunk)` tokens and attention needs
+the sliding window of them resident, so the spare room is whatever is left over:
+one prefill chunk, 128 tokens, at every supported `--max-context` for Gemma 4
+26B-A4B. Moving back further — resending a prompt whose previous answer was
+longer than that — prefills the whole prompt again and reports
+`cached_tokens: 0`.
+
+Within that limit an identical resubmission reuses every prompt token except the
+last, so `cached_tokens` is `prompt_tokens - 1`. The final token is always
+prefilled: the sampler needs its logits, and a reused token produces none.
+
+The limit is on how far back the cursor moves, not on how long the conversation
+is; a history that keeps growing resumes from the retained cursor at any length.
+
 The server retains one prefix. A different or incompatible history replaces
 it. Use `--prompt-cache-mode off` to disable reuse.
 

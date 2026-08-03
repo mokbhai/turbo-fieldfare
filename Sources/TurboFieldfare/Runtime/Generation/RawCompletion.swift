@@ -14,7 +14,14 @@ public enum RawDecodeProgress: Sendable {
 
 public enum RawCompletionStart: Sendable, Equatable {
     case reset
-    case resume(cachedPromptTokens: Int)
+    /// Resume from a KV prefix the caller has already verified.
+    ///
+    /// `allowingRewind` defaults to off so a caller that merely tracks a cursor
+    /// keeps the fail-closed mismatch error. Set it only when the cached count
+    /// may legitimately fall *short* of the KV cursor — an identical
+    /// resubmission, say — and the shorter prefix has been checked to be the
+    /// KV's own prefix.
+    case resume(cachedPromptTokens: Int, allowingRewind: Bool = false)
 }
 
 public struct RawDecodeResult: Sendable {
@@ -103,7 +110,7 @@ public func runRawCompletion(producer: any LogitProducer,
     switch start {
     case .reset:
         cachedPromptTokens = 0
-    case .resume(let count):
+    case .resume(let count, _):
         guard count > 0, count < promptIds.count else {
             throw GeneratorError.invalidContinuation(
                 "cached prompt token count must be greater than zero and less than the effective prompt")
@@ -129,9 +136,10 @@ public func runRawCompletion(producer: any LogitProducer,
     switch start {
     case .reset:
         producer.reset()
-    case .resume:
+    case .resume(_, let allowingRewind):
         let continuable = producer as! any ContinuableLogitProducer
-        try continuable.prepareForContinuation(expectedPosition: cachedPromptTokens)
+        try continuable.prepareForContinuation(expectedPosition: cachedPromptTokens,
+                                               allowingRewind: allowingRewind)
     }
     let prefillStart = Date()
     var position = cachedPromptTokens

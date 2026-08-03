@@ -385,14 +385,36 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         kv?.position ?? 0
     }
 
-    public func prepareForContinuation(expectedPosition: Int) throws {
+    /// Non-throwing probe for callers that must choose between resuming and
+    /// resetting before they commit to either. Reports what a rewind-allowing
+    /// continuation could reach, so only pair it with `allowingRewind: true`.
+    public func canResume(from position: Int) -> Bool {
+        // Delegated so the answer is testable: this runner needs the checkpoint
+        // to exist at all, a `KVCacheManager` needs only a Metal device.
+        kv?.canResume(from: position) ?? false
+    }
+
+    public func prepareForContinuation(expectedPosition: Int, allowingRewind: Bool) throws {
         guard let kv else {
             throw PrefillError.prefillCursorMismatch(
                 "continuation requires an initialized KV cache")
         }
-        guard expectedPosition > 0, kv.position == expectedPosition else {
+        guard expectedPosition > 0 else {
             throw PrefillError.prefillCursorMismatch(
                 "continuation expected KV position \(expectedPosition), current \(kv.position)")
+        }
+        // A shorter continuation re-prefills tokens the KV already holds, which
+        // is safe as long as the cursor can move back to them. A longer one
+        // never is — it would attend over slots nothing has written. Callers that
+        // did not opt in keep the strict equality: for them a disagreeing cursor
+        // is the only sign their bookkeeping has drifted.
+        if kv.position != expectedPosition {
+            guard allowingRewind, expectedPosition < kv.position,
+                  kv.canRewind(to: expectedPosition) else {
+                throw PrefillError.prefillCursorMismatch(
+                    "continuation expected KV position \(expectedPosition), current \(kv.position)")
+            }
+            kv.rewind(to: expectedPosition)
         }
         resetTransientState()
     }
