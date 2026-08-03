@@ -43,7 +43,9 @@ final class FakeInferenceClient: AppModelLifecycleClient, Sendable {
     }
 
     func unload() async {
-        cancel()
+        // Not `cancel()`: unloading is not a Stop, so it must not leave a cancel
+        // armed for whatever generation the next load runs.
+        generationTasks.takeCurrent()?.cancel()
         state.value.withLock { $0.loadedKey = nil }
     }
 
@@ -68,10 +70,18 @@ final class FakeInferenceClient: AppModelLifecycleClient, Sendable {
             }
 
             let id = UUID()
-            guard generationTasks.reserve(id) else {
+            switch generationTasks.reserve(id) {
+            case .cancelled:
+                continuation.yield(.cancelled(.cancelledBeforeGeneration(
+                    runtimeOptions: request.runtimeOptions)))
+                continuation.finish(throwing: AppInferenceError.cancelled)
+                return
+            case .busy:
                 continuation.yield(.failed(.generationInFlight, partial: nil))
                 continuation.finish(throwing: AppInferenceError.generationInFlight)
                 return
+            case .reserved:
+                break
             }
             let task = Task { [self] in
                 await streamResponse(request: request,
@@ -87,7 +97,11 @@ final class FakeInferenceClient: AppModelLifecycleClient, Sendable {
     }
 
     func cancel() {
-        generationTasks.takeCurrent()?.cancel()
+        generationTasks.cancelCurrentOrArmNext()?.cancel()
+    }
+
+    func expectGeneration() {
+        generationTasks.expectGeneration()
     }
 
     private func streamResponse(

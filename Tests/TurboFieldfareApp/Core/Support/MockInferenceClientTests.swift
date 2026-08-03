@@ -73,6 +73,43 @@ import Testing
         #expect(cancelledDiagnostics?.prefillSeconds != nil)
     }
 
+    /// The fake has to model the real clients' cancel contract, or the AppModel
+    /// tests that rely on it would prove nothing.
+    @Test func cancelBeforeGenerateCancelsThatGenerationAndOnlyThatOne() async throws {
+        let client = MockInferenceClient(response: "one two three", tokenDelayNanos: 1)
+        let request = AppGenerationRequest(
+            modelDirectory: FileManager.default.temporaryDirectory,
+            messages: [.init(role: .user, content: "go")], maxNewTokens: 3)
+
+        client.expectGeneration()
+        client.cancel()
+
+        var events: [AppInferenceEvent] = []
+        var thrown: Error?
+        do {
+            for try await event in client.generate(request) { events.append(event) }
+        } catch {
+            thrown = error
+        }
+        #expect(events.count == 1)
+        if case .cancelled(let diagnostics) = events.first {
+            #expect(diagnostics.stopReason == .cancelled)
+        } else {
+            Issue.record("expected a cancelled event, got \(events)")
+        }
+        #expect(thrown as? AppInferenceError == .cancelled)
+
+        var text = ""
+        var finished = false
+        for try await event in client.generate(request) {
+            if case .token(let token) = event { text += token.textDelta }
+            if case .finished = event { finished = true }
+            if case .cancelled = event { Issue.record("stale cancel killed the next run") }
+        }
+        #expect(finished)
+        #expect(text.contains("one"))
+    }
+
     @Test func concurrentGenerationRejected() async throws {
         let client = MockInferenceClient(response: "one two three", tokenDelayNanos: 20_000_000)
         let request = AppGenerationRequest(modelDirectory: FileManager.default.temporaryDirectory, messages: [.init(role: .user, content: "go")], maxNewTokens: 3)

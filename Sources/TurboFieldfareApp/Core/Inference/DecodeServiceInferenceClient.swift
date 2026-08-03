@@ -6,12 +6,50 @@ import TurboFieldfareDecodeProtocol
 
 public final class DecodeServiceInferenceClient: AppModelLifecycleClient,
     AppInferenceMemoryReporting, AppInferenceTranscriptReporting, @unchecked Sendable {
+    /// Where a generation stands relative to the socket, which decides what a
+    /// cancel can do about it. Only `.streaming` has a request the service can
+    /// be asked to stop.
+    private enum GenerationPhase {
+        /// No generation. `expectingGeneration` is set by `expectGeneration()`
+        /// and cleared when `generate` claims the phase: it marks the only
+        /// stretch of time in which a cancel has a run to belong to but no
+        /// request on the wire to name.
+        case idle(expectingGeneration: Bool)
+        /// A cancel landed with no generation registered. It belongs to the run
+        /// the app has already started but has not framed yet, so it waits here
+        /// for that run's `generate` to claim it.
+        case cancelPending
+        /// `generate` is framing its request; the service has not seen it.
+        case starting(id: UUID, cancelRequested: Bool)
+        /// The request is on the wire; only the service can end it now.
+        case streaming(id: UUID)
+
+        /// Which generation owns the phase, so a caller that speaks for one
+        /// generation cannot act on another's. Every `generate` gets a stream
+        /// and a termination handler, including the ones refused outright, and
+        /// those handlers all run against this single shared phase.
+        var owner: UUID? {
+            switch self {
+            case .idle, .cancelPending: nil
+            case .starting(let id, _), .streaming(let id): id
+            }
+        }
+    }
+
+    /// What a `generate` call may do with the phase it tried to claim.
+    private enum GenerationClaim {
+        case claimed
+        case cancelled
+        case busy
+    }
+
     private struct Connection {
         var input: FileHandle?
         var output: FileHandle?
         var loadedDirectory: URL?
         var launchLabel: String?
         var socketPath: String?
+        var generation: GenerationPhase = .idle(expectingGeneration: false)
     }
 
     private let connection = Mutex(Connection())
@@ -25,6 +63,17 @@ public final class DecodeServiceInferenceClient: AppModelLifecycleClient,
 
     public init(serviceURL: URL? = nil) {
         self.serviceURL = serviceURL ?? Self.defaultServiceURL()
+    }
+
+    /// Test seam: adopts an already-connected pair of handles so the frames this
+    /// client puts on the socket can be observed without launching the service.
+    init(input: FileHandle, output: FileHandle,
+         serviceURL: URL = URL(fileURLWithPath: "/nonexistent-decode-service")) {
+        self.serviceURL = serviceURL
+        connection.withLock {
+            $0.input = input
+            $0.output = output
+        }
     }
 
     public func ensureLoaded(modelDirectory: URL, maxContextTokens: Int,
@@ -63,13 +112,37 @@ public final class DecodeServiceInferenceClient: AppModelLifecycleClient,
     public func generate(_ request: AppGenerationRequest)
         -> AsyncThrowingStream<AppInferenceEvent, Error> {
         AsyncThrowingStream { continuation in
+            // Minted out here so the termination handler below can name the
+            // generation it speaks for.
+            let generationID = UUID()
             let task = Task.detached(priority: .userInitiated) { [self] in
+                // Claimed before anything else can fail: a cancel armed for this
+                // run must be consumed by this run, or it would be left behind
+                // to end the next one.
+                switch claimGenerationStart(generationID) {
+                case .cancelled:
+                    // No `endGeneration()` here: the claim already left the
+                    // phase idle, and wiping it again could discard a cancel
+                    // that has since been armed for the following run.
+                    continuation.yield(.cancelled(.cancelledBeforeGeneration(
+                        runtimeOptions: request.runtimeOptions)))
+                    continuation.finish(throwing: AppInferenceError.cancelled)
+                    return
+                case .busy:
+                    continuation.yield(.failed(.generationInFlight, partial: nil))
+                    continuation.finish(throwing: AppInferenceError.generationInFlight)
+                    return
+                case .claimed:
+                    break
+                }
+                // Backstop only. Every terminal path below ends the generation
+                // explicitly before finishing the stream; see `finish`.
+                defer { endGeneration(generationID) }
                 do {
                     try request.validate()
                     guard let handles = currentHandles() else {
                         throw AppInferenceError.modelNotLoaded
                     }
-                    let generationID = UUID()
                     generationTranscriptMailbox.reset()
                     let command = DecodeGenerationRequest(
                         messages: request.messages, maxNewTokens: request.maxNewTokens,
@@ -80,6 +153,15 @@ public final class DecodeServiceInferenceClient: AppModelLifecycleClient,
                         generationID: generationID)
                     try handles.input.write(contentsOf: DecodeFrameCodec.encode(
                         DecodeServiceCommand.generate(command)))
+                    // From here the service owns the request, so a cancel is
+                    // written rather than held. One that arrived while this
+                    // frame was being encoded is forwarded here, on this thread,
+                    // so the two commands cannot interleave on the socket or
+                    // reach the service before the request they refer to.
+                    if markStreamingTakingPendingCancel(generationID) {
+                        try? handles.input.write(contentsOf: DecodeFrameCodec.encode(
+                            DecodeServiceCommand.cancel))
+                    }
 
                     var expectedSequence: UInt64 = 1
                     var lastMetricYield = Date.distantPast
@@ -125,35 +207,157 @@ public final class DecodeServiceInferenceClient: AppModelLifecycleClient,
                         switch event.kind {
                         case .finished:
                             continuation.yield(.finished(diagnostics))
-                            continuation.finish()
+                            finish(continuation, generationID)
                         case .cancelled:
                             continuation.yield(.cancelled(diagnostics))
-                            continuation.finish()
+                            finish(continuation, generationID)
                         case .failed:
                             let error = Self.failure(
                                 event, maxContextTokens: request.maxContextTokens)
                             continuation.yield(.failed(error, partial: diagnostics))
-                            continuation.finish(throwing: error)
+                            finish(continuation, generationID, throwing: error)
                         default:
                             continue
                         }
                         return
                     }
                 } catch {
-                    continuation.finish(throwing: error)
+                    finish(continuation, generationID, throwing: error)
                 }
             }
             continuation.onTermination = { [weak self] _ in
                 task.cancel()
-                self?.cancel()
+                // Termination also fires on a normal finish, when the run is
+                // already over. Stopping a request the service is still
+                // producing is worth doing; arming a cancel is not, because
+                // there is no longer a run for it to belong to and it would be
+                // spent on the next one.
+                self?.cancelStreamingGeneration(generationID)
             }
         }
     }
 
+    /// Stops the current generation, whatever stage it has reached. Writing the
+    /// cancel command only works once the request itself has been written;
+    /// before that there is nothing on the far side to name, so the request is
+    /// recorded and the generation is stopped where it still can be — locally,
+    /// before it is ever sent.
     public func cancel() {
-        guard let input = currentHandles()?.input else { return }
+        let input = connection.withLock { state -> FileHandle? in
+            switch state.generation {
+            case .idle(let expectingGeneration):
+                // Held only for a run that has started and not yet framed its
+                // request. Outside that window this cancel followed a run that
+                // is already over, and holding it would end the next one.
+                if expectingGeneration { state.generation = .cancelPending }
+                return nil
+            case .cancelPending:
+                return nil
+            case .starting(let id, _):
+                state.generation = .starting(id: id, cancelRequested: true)
+                return nil
+            case .streaming:
+                return state.input
+            }
+        }
+        writeCancelCommand(to: input)
+    }
+
+    public func expectGeneration() {
+        connection.withLock { state in
+            switch state.generation {
+            case .idle, .cancelPending:
+                // Also drops a cancel held for a run that never reached
+                // `generate`: it cannot belong to the run starting now.
+                state.generation = .idle(expectingGeneration: true)
+            case .starting, .streaming:
+                break
+            }
+        }
+    }
+
+    /// The half of `cancel()` that never arms anything: used where a cancel has
+    /// no run of its own to belong to. Scoped to `generationID` so a stream that
+    /// never owned the phase — one refused as busy, say — cannot stop the
+    /// generation that does own it.
+    private func cancelStreamingGeneration(_ generationID: UUID) {
+        let input = connection.withLock { state -> FileHandle? in
+            guard case .streaming(generationID) = state.generation else { return nil }
+            return state.input
+        }
+        writeCancelCommand(to: input)
+    }
+
+    private func writeCancelCommand(to input: FileHandle?) {
+        guard let input else { return }
         try? input.write(contentsOf: DecodeFrameCodec.encode(
             DecodeServiceCommand.cancel))
+    }
+
+    /// Whether the generation that is starting may run. A cancel armed before
+    /// `generate` was entered is consumed here — the one place it is consumed,
+    /// so it can only ever end the generation it was armed for.
+    private func claimGenerationStart(_ generationID: UUID) -> GenerationClaim {
+        connection.withLock { state in
+            switch state.generation {
+            case .cancelPending:
+                state.generation = .idle(expectingGeneration: false)
+                return .cancelled
+            case .starting, .streaming:
+                // Another generation already owns the socket. Overwriting its
+                // phase would let these two runs end each other, so this one is
+                // refused instead — the same answer `RealInferenceClient` gives.
+                return .busy
+            case .idle:
+                state.generation = .starting(id: generationID,
+                                             cancelRequested: false)
+                return .claimed
+            }
+        }
+    }
+
+    /// Marks the request as sent and reports whether a cancel arrived while it
+    /// was being framed, which the caller must then forward.
+    private func markStreamingTakingPendingCancel(_ generationID: UUID) -> Bool {
+        connection.withLock { state in
+            guard case .starting(generationID, let cancelRequested) = state.generation
+            else { return false }
+            state.generation = .streaming(id: generationID)
+            return cancelRequested
+        }
+    }
+
+    /// Releases the client when a generation ends. A cancel that arrives after
+    /// this point finds no generation and is a no-op, which is what keeps a late
+    /// Stop from being held against the next run. Scoped to `generationID` so a
+    /// run that never owned the phase cannot release another run's.
+    private func endGeneration(_ generationID: UUID) {
+        connection.withLock { state in
+            guard state.generation.owner == generationID else { return }
+            state.generation = .idle(expectingGeneration: false)
+        }
+    }
+
+    /// Ends the generation *before* finishing the stream.
+    ///
+    /// `onTermination` runs synchronously inside `finish()`, ahead of any
+    /// `defer` in the task body. Left at `.streaming`, a run that ended
+    /// perfectly normally would make `cancelStreamingGeneration()` write a
+    /// cancel frame for a request the service has already completed. The
+    /// service applies that frame out of band, finds no generation, and holds
+    /// it against whatever runs next — so a successful generation would cancel
+    /// the one after it.
+    private func finish(
+        _ continuation: AsyncThrowingStream<AppInferenceEvent, Error>.Continuation,
+        _ generationID: UUID,
+        throwing error: Error? = nil
+    ) {
+        endGeneration(generationID)
+        if let error {
+            continuation.finish(throwing: error)
+        } else {
+            continuation.finish()
+        }
     }
 
     deinit {

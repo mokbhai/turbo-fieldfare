@@ -12,6 +12,10 @@ final class MockInferenceClient: AppInferenceClient, @unchecked Sendable {
     private let lock = NSLock()
     private var activeTask: Task<Void, Never>?
     private var activeGenerationID: UUID?
+    private var pendingCancel = false
+    private var expectsGeneration = false
+    private var entryGate: DispatchSemaphore?
+    private var isHeldAtEntry = false
     private let memorySampler: AppMemorySampler
 
     init(response: String = "This is a lightweight mock response streaming through the TurboFieldfare Mac shell.",
@@ -24,8 +28,72 @@ final class MockInferenceClient: AppInferenceClient, @unchecked Sendable {
         self.failureMessage = failureMessage
     }
 
+    /// Holds the next `generate` at its first instruction, before it has
+    /// registered anything a cancel could act on. That window is where the real
+    /// clients live too — `RealInferenceClient` only becomes cancellable once
+    /// `generate` has reserved its task, and the decode service only once the
+    /// request has reached the socket — so this is what lets a test land a
+    /// cancel inside it instead of racing for it.
+    func holdBeforeGenerate() {
+        lock.lock()
+        entryGate = DispatchSemaphore(value: 0)
+        lock.unlock()
+    }
+
+    /// True once a `generate` call is parked at that gate.
+    var isHeldBeforeGenerate: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return isHeldAtEntry
+    }
+
+    func releaseGenerate() {
+        lock.lock()
+        let gate = entryGate
+        entryGate = nil
+        lock.unlock()
+        gate?.signal()
+    }
+
     func generate(_ request: AppGenerationRequest) -> AsyncThrowingStream<AppInferenceEvent, Error> {
-        AsyncThrowingStream { continuation in
+        // Blocking is the point: `generate` is synchronous, so a caller that has
+        // asked for a generation cannot be observed to have one until it
+        // returns.
+        lock.lock()
+        let gate = entryGate
+        if gate != nil { isHeldAtEntry = true }
+        lock.unlock()
+        gate?.wait()
+        if gate != nil {
+            lock.lock()
+            isHeldAtEntry = false
+            lock.unlock()
+        }
+
+        return AsyncThrowingStream { continuation in
+            lock.lock()
+            // In flight is decided first, as `GenerationTaskRegistry.reserve`
+            // decides it: a second, concurrent `generate` never starts a run,
+            // so it must not spend a cancel raised for the run already going.
+            if activeTask != nil {
+                lock.unlock()
+                continuation.yield(.failed(.generationInFlight, partial: nil))
+                continuation.finish(throwing: AppInferenceError.generationInFlight)
+                return
+            }
+            // Consumed before any other outcome so that a cancel armed for this
+            // generation is spent on it and cannot reach the next one.
+            expectsGeneration = false
+            let wasCancelledBeforeStart = pendingCancel
+            pendingCancel = false
+            lock.unlock()
+            if wasCancelledBeforeStart {
+                continuation.yield(.cancelled(.cancelledBeforeGeneration(
+                    runtimeOptions: request.runtimeOptions)))
+                continuation.finish(throwing: AppInferenceError.cancelled)
+                return
+            }
+
             do {
                 try request.validate()
             } catch {
@@ -36,12 +104,6 @@ final class MockInferenceClient: AppInferenceClient, @unchecked Sendable {
             }
 
             lock.lock()
-            if activeTask != nil {
-                lock.unlock()
-                continuation.yield(.failed(.generationInFlight, partial: nil))
-                continuation.finish(throwing: AppInferenceError.generationInFlight)
-                return
-            }
             memorySampler.resetPeak()
             _ = memorySampler.sample()
             let generationID = UUID()
@@ -53,12 +115,38 @@ final class MockInferenceClient: AppInferenceClient, @unchecked Sendable {
             lock.unlock()
 
             continuation.onTermination = { [weak self] _ in
-                self?.cancel()
+                // Never `cancel()`: termination also means "finished", and
+                // arming a cancel here would leave it for the next generation.
+                self?.cancelActiveTask()
             }
         }
     }
 
     func cancel() {
+        lock.lock()
+        let task = activeTask
+        // Stop reached the client before `generate` registered anything. Hold
+        // the request for the generation that is starting instead of dropping
+        // it, which is what let a cancelled run stream to completion — but only
+        // inside the window a starting run opened, mirroring the real clients.
+        if task == nil, expectsGeneration { pendingCancel = true }
+        activeTask = nil
+        activeGenerationID = nil
+        lock.unlock()
+        task?.cancel()
+    }
+
+    /// Opens the window, and deliberately does no more than that. Wiping a
+    /// leftover cancel here as well would answer every stale cancel by the wipe
+    /// rather than by the window, and the AppModel tests that name the window
+    /// would then pass against a fake that has no window at all.
+    func expectGeneration() {
+        lock.lock()
+        expectsGeneration = true
+        lock.unlock()
+    }
+
+    private func cancelActiveTask() {
         lock.lock()
         let task = activeTask
         activeTask = nil

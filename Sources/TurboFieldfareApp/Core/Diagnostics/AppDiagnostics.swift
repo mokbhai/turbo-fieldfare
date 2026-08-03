@@ -104,6 +104,23 @@ public struct AppDiagnostics: Equatable, Sendable {
         self.prefill = prefill
         self.runner = runner
     }
+
+    /// Terminal diagnostics for a run that was stopped before generation began:
+    /// nothing was prefilled, nothing was decoded, and no memory was sampled for
+    /// it. The stop reason is still `cancelled` rather than `failed` because the
+    /// two are not interchangeable — the prompt cache publishes on one and not
+    /// the other, and the UI reads a failure as something that went wrong.
+    public static func cancelledBeforeGeneration(
+        runtimeOptions: AppRuntimeOptions
+    ) -> AppDiagnostics {
+        AppDiagnostics(generatedTokens: 0,
+                       stopReason: .cancelled,
+                       timeToFirstTokenSeconds: nil,
+                       decodeSeconds: 0,
+                       tokensPerSecond: 0,
+                       peakMemoryBytes: nil,
+                       runtimeOptions: runtimeOptions)
+    }
 }
 
 public struct AppTokenEvent: Equatable, Sendable {

@@ -30,6 +30,11 @@ import TurboFieldfareDecodeProtocol
                 while true {
                     let command = try DecodeFrameCodec.read(
                         DecodeServiceCommand.self, from: handles.input)
+                    // Both applied here rather than from the command loop: a
+                    // cancel has to overtake the queue to reach a generation
+                    // that is still waiting in it, and the client can only hold
+                    // that cancel if it has been told the generation is coming.
+                    if case .generate = command { client.expectGeneration() }
                     if case .cancel = command { client.cancel() }
                     commands.append(command)
                     if case .shutdown = command { break }
@@ -68,13 +73,18 @@ import TurboFieldfareDecodeProtocol
                         error: "\(error)"), to: handles.output)
                 }
             case .generate(let request):
+                // Both refusals answer a generation the input thread already
+                // announced, so each has to take that announcement back: the
+                // run it opened the cancel window for is not going to happen.
                 guard let modelDirectory else {
+                    client.abandonExpectedGeneration()
                     try? write(DecodeServiceEvent(
                         kind: .failed, generationID: request.generationID,
                         error: "model is not loaded"), to: handles.output)
                     continue
                 }
                 guard request.runtimeOptions == loadedOptions else {
+                    client.abandonExpectedGeneration()
                     try? write(DecodeServiceEvent(
                         kind: .failed, generationID: request.generationID,
                         error: "generation runtime options do not match the loaded session"),

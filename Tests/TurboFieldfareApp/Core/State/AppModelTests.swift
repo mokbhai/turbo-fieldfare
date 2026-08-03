@@ -498,6 +498,96 @@ import Testing
         #expect(client.ensureLoadedCallCount() == 0)
     }
 
+    /// Stop pressed in the window between Generate and the first event of the
+    /// stream. The client is not cancellable yet there, so the cancel used to be
+    /// dropped and the run streamed to completion with the UI stuck on
+    /// "Stopping…".
+    @MainActor
+    @Test func cancelBeforeTheStreamStartsEndsTheRunAsCancelled() async throws {
+        let client = MockInferenceClient(response: "one two three", tokenDelayNanos: 1)
+        let model = readyModel(client: client)
+        model.promptText = "stop immediately"
+        client.holdBeforeGenerate()
+
+        model.run()
+        for _ in 0..<200 where !client.isHeldBeforeGenerate {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        #expect(client.isHeldBeforeGenerate)
+
+        model.cancel()
+        #expect(model.isCancellationPending)
+        client.releaseGenerate()
+        await waitForIdle(model)
+
+        #expect(!model.isRunning)
+        #expect(!model.isCancellationPending)
+        #expect(model.error == .cancelled)
+        #expect(model.diagnostics?.stopReason == .cancelled)
+        #expect(model.diagnostics?.generatedTokens == 0)
+        // Nothing was generated, so nothing may be committed and the submitted
+        // prompt goes back to the composer.
+        #expect(model.outputText.isEmpty)
+        #expect(model.committedTurns.isEmpty)
+        #expect(model.promptText == "stop immediately")
+    }
+
+    /// The record of "cancel was requested" belongs to the run that was starting
+    /// and to no other: the run after it must generate normally.
+    @MainActor
+    @Test func cancelBeforeTheStreamStartsDoesNotCancelTheNextRun() async throws {
+        let client = MockInferenceClient(response: "answer", tokenDelayNanos: 1)
+        let model = readyModel(client: client)
+        model.promptText = "cancel this one"
+        client.holdBeforeGenerate()
+
+        model.run()
+        for _ in 0..<200 where !client.isHeldBeforeGenerate {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        model.cancel()
+        client.releaseGenerate()
+        await waitForIdle(model)
+        #expect(model.error == .cancelled)
+
+        model.promptText = "run this one"
+        model.run()
+        await waitForIdle(model)
+
+        #expect(model.error == nil)
+        #expect(model.diagnostics?.stopReason != .cancelled)
+        #expect(model.committedTurns.map(\.role) == [.user, .assistant])
+        #expect(model.committedTurns.first?.content == "run this one")
+        #expect(model.committedTurns.last?.content.isEmpty == false)
+    }
+
+    /// A Stop can reach the client just after the run it was meant for ended —
+    /// the terminal event is already on its way to the main actor, so the button
+    /// is still live. On its own the client cannot tell that cancel from one
+    /// raised a moment *before* a run, which it does have to hold. The window
+    /// `run()` opens is the only thing that separates them, so this one lands
+    /// outside it and must be dropped where it arrives, not carried forward.
+    @MainActor
+    @Test func cancelLandingAfterARunEndedDoesNotCancelTheNextRun() async throws {
+        let client = MockInferenceClient(response: "answer", tokenDelayNanos: 1)
+        let model = readyModel(client: client)
+        model.promptText = "first"
+        model.run()
+        await waitForIdle(model)
+        #expect(model.error == nil)
+
+        client.cancel()
+
+        model.promptText = "second"
+        model.run()
+        await waitForIdle(model)
+
+        #expect(model.error == nil)
+        #expect(model.diagnostics?.stopReason != .cancelled)
+        #expect(model.committedTurns.map(\.role) == [.user, .assistant, .user, .assistant])
+        #expect(model.committedTurns.last?.content.contains("second") == true)
+    }
+
     @MainActor
     @Test func cancelAfterPartialOutputCanBeCleared() async throws {
         let client = MockInferenceClient(response: "one two three four five", tokenDelayNanos: 20_000_000)

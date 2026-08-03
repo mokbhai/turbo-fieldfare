@@ -1143,6 +1143,13 @@ public final class AppModel {
             options: request.runtimeOptions,
             forceLogitsHead: !request.isPureGreedy)
         isCancellationPending = false
+        // The client can hold a cancel that arrived before a stream existed, so
+        // that a Stop pressed straight after Generate is not lost. It cannot
+        // tell that case apart from a Stop that landed a moment after the last
+        // run ended; this can, because a new run starts here. Announcing the
+        // run is what opens that holding window — and closes it around every
+        // other moment — so one run's cancel can never end another.
+        client.expectGeneration()
         liveTokenCount = 0
         liveElapsedDecodeSeconds = 0
         livePrefillDone = 0

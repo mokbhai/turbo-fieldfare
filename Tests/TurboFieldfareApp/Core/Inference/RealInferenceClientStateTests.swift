@@ -11,9 +11,9 @@ import TurboFieldfare
         let registry = GenerationTaskRegistry()
         let first = UUID()
         let second = UUID()
-        #expect(registry.reserve(first))
+        #expect(registry.reserve(first) == .reserved)
         registry.clear(first)
-        #expect(registry.reserve(second))
+        #expect(registry.reserve(second) == .reserved)
         let secondTask = Task<Void, Never> {
             do { try await Task.sleep(for: .seconds(10)) } catch {}
         }
@@ -29,19 +29,19 @@ import TurboFieldfare
         let registry = GenerationTaskRegistry()
         let first = UUID()
         let second = UUID()
-        #expect(registry.reserve(first))
-        #expect(!registry.reserve(second))
+        #expect(registry.reserve(first) == .reserved)
+        #expect(registry.reserve(second) == .busy)
         registry.clear(second)
-        #expect(!registry.reserve(second))
+        #expect(registry.reserve(second) == .busy)
         registry.clear(first)
-        #expect(registry.reserve(second))
+        #expect(registry.reserve(second) == .reserved)
         registry.clear(second)
     }
 
     @Test func generationRegistryCancelsTaskAttachedAfterReservationEnded() async {
         let registry = GenerationTaskRegistry()
         let id = UUID()
-        #expect(registry.reserve(id))
+        #expect(registry.reserve(id) == .reserved)
         registry.clear(id)
         let task = Task<Void, Never> {
             do { try await Task.sleep(for: .seconds(10)) } catch {}
@@ -49,8 +49,150 @@ import TurboFieldfare
         registry.attach(task, to: id)
         #expect(task.isCancelled)
         let next = UUID()
-        #expect(registry.reserve(next))
+        #expect(registry.reserve(next) == .reserved)
         registry.clear(next)
+    }
+
+    @Test func generationRegistryHoldsACancelThatArrivesBeforeTheGeneration() {
+        let registry = GenerationTaskRegistry()
+
+        registry.expectGeneration()
+        #expect(registry.cancelCurrentOrArmNext() == nil)
+        #expect(registry.reserve(UUID()) == .cancelled)
+        // Spent on that one generation only: the next reserve is a normal one.
+        let next = UUID()
+        #expect(registry.reserve(next) == .reserved)
+        registry.clear(next)
+    }
+
+    /// The regression: a cancel that lands once a generation is over belongs to
+    /// no run. The decode service delivers exactly that — it applies cancel
+    /// frames out of band, and a frame written by a finished stream arrives
+    /// after its generation ended — so holding it here would kill the run after.
+    @Test func generationRegistryDropsACancelThatFollowsAFinishedGeneration() {
+        let registry = GenerationTaskRegistry()
+        let first = UUID()
+        registry.expectGeneration()
+        #expect(registry.reserve(first) == .reserved)
+        registry.clear(first)
+
+        #expect(registry.cancelCurrentOrArmNext() == nil)
+
+        let second = UUID()
+        #expect(registry.reserve(second) == .reserved)
+        registry.clear(second)
+    }
+
+    /// The decode service announces a generation the moment its frame arrives
+    /// and can then refuse it — an unloaded model, mismatched runtime options —
+    /// without ever reserving. Taking the announcement back is what stops the
+    /// window staying open over a run that is never coming, where a later stray
+    /// cancel would arm itself and be spent on whichever run does arrive.
+    @Test func generationRegistryDropsACancelHeldForAnAbandonedGeneration() {
+        let registry = GenerationTaskRegistry()
+        registry.expectGeneration()
+        #expect(registry.cancelCurrentOrArmNext() == nil)
+
+        registry.abandonExpectedGeneration()
+
+        // Neither the cancel already held for that run nor the next one to
+        // arrive can reach the generation that eventually does reserve.
+        #expect(registry.cancelCurrentOrArmNext() == nil)
+
+        let id = UUID()
+        #expect(registry.reserve(id) == .reserved)
+        registry.clear(id)
+    }
+
+    @Test func generationRegistryTeardownDoesNotArmTheNextGeneration() {
+        let registry = GenerationTaskRegistry()
+        let id = UUID()
+        #expect(registry.reserve(id) == .reserved)
+        let task = Task<Void, Never> {
+            do { try await Task.sleep(for: .seconds(10)) } catch {}
+        }
+        registry.attach(task, to: id)
+
+        registry.takeCurrent()?.cancel()
+
+        #expect(task.isCancelled)
+        #expect(registry.reserve(UUID()) == .reserved)
+    }
+
+    @Test func cancelBeforeGenerateEndsThatGenerationAsCancelled() async throws {
+        let client = RealInferenceClient()
+        let request = AppGenerationRequest(
+            modelDirectory: URL(fileURLWithPath: "/nonexistent/model.gturbo"),
+            messages: [.init(role: .user, content: "hello")])
+
+        client.expectGeneration()
+        client.cancel()
+
+        var events: [AppInferenceEvent] = []
+        var thrown: Error?
+        do {
+            for try await event in client.generate(request) { events.append(event) }
+        } catch {
+            thrown = error
+        }
+
+        // Cancelled, not failed: the two are not interchangeable downstream.
+        #expect(events.count == 1)
+        if case .cancelled(let diagnostics) = events.first {
+            #expect(diagnostics.stopReason == .cancelled)
+            #expect(diagnostics.generatedTokens == 0)
+        } else {
+            Issue.record("expected a cancelled event, got \(events)")
+        }
+        #expect(thrown as? AppInferenceError == .cancelled)
+
+        // The next generation is unaffected: it reaches the load check and fails
+        // there, which it could not do if the cancel were still armed.
+        var secondFailure: AppInferenceError?
+        do {
+            for try await event in client.generate(request) {
+                if case .cancelled = event { Issue.record("stale cancel killed the next run") }
+            }
+        } catch let error as AppInferenceError {
+            secondFailure = error
+        }
+        #expect(secondFailure != nil)
+        #expect(secondFailure != .cancelled)
+    }
+
+    /// The client the decode service runs is cancelled out of band, so a cancel
+    /// can land after the generation it named has ended. Driven through a real
+    /// stream so the terminal ordering — `onTermination` firing inside
+    /// `finish()` — is the production one rather than a stand-in for it.
+    @Test func cancelLandingAfterAGenerationEndedDoesNotCancelTheNextOne() async throws {
+        let client = RealInferenceClient()
+        let request = AppGenerationRequest(
+            modelDirectory: URL(fileURLWithPath: "/nonexistent/model.gturbo"),
+            messages: [.init(role: .user, content: "hello")])
+
+        client.expectGeneration()
+        var firstFailure: AppInferenceError?
+        do {
+            for try await _ in client.generate(request) {}
+        } catch let error as AppInferenceError {
+            firstFailure = error
+        }
+        #expect(firstFailure != nil)
+        #expect(firstFailure != .cancelled)
+
+        client.cancel()
+
+        var secondFailure: AppInferenceError?
+        do {
+            for try await event in client.generate(request) {
+                if case .cancelled = event { Issue.record("stale cancel killed the next run") }
+            }
+        } catch let error as AppInferenceError {
+            secondFailure = error
+        }
+        // Reaches and fails at the same check the first run did, which it could
+        // not do if the trailing cancel were still armed.
+        #expect(secondFailure == firstFailure)
     }
 
     @Test func generationRunnerPolicyKeepsFusionHeadForPureGreedyChunkedPrefill() {
@@ -182,10 +324,28 @@ import TurboFieldfare
         #expect(diagnostics.unsupportedReason?.contains("synthetic unsupported") == true)
     }
 
-    @Test func cancelWhenIdleIsNoOp() {
+    /// A cancel raised while the run that is starting has no stream yet is held
+    /// for it, so repeating it must stay harmless — and must not stack up into
+    /// several cancels.
+    @Test func repeatedCancelWhenIdleIsSafe() async throws {
         let client = RealInferenceClient()
+        let request = AppGenerationRequest(
+            modelDirectory: URL(fileURLWithPath: "/nonexistent/model.gturbo"),
+            messages: [.init(role: .user, content: "hello")])
+
+        client.expectGeneration()
         client.cancel()
         client.cancel()
+
+        var cancelledGenerations = 0
+        for _ in 0..<2 {
+            do {
+                for try await event in client.generate(request) {
+                    if case .cancelled = event { cancelledGenerations += 1 }
+                }
+            } catch {}
+        }
+        #expect(cancelledGenerations == 1)
     }
 
     @Test func unloadWhenIdleIsSafe() async {

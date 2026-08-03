@@ -5,48 +5,124 @@ import TurboFieldfare
 import Synchronization
 
 final class GenerationTaskRegistry: Sendable {
+    /// What a `generate` call may do with the id it tried to reserve.
+    enum Reservation: Equatable {
+        case reserved
+        /// A cancel arrived while nothing was registered, so it was meant for
+        /// the generation that had not started yet: this one.
+        case cancelled
+        case busy
+    }
+
     private struct Entry: Sendable {
         let id: UUID
         var task: Task<Void, Never>?
     }
 
-    private let state = Mutex<Entry?>(nil)
+    private struct State: Sendable {
+        var entry: Entry?
+        /// Armed only by a cancel that found nothing to cancel, and consumed by
+        /// the very next `reserve`. Both halves live under the one mutex so the
+        /// arm and the consume can never straddle a generation boundary.
+        var pendingCancel = false
+        /// True between `expectGeneration()` and the `reserve` that follows it:
+        /// the only stretch of time in which a cancel has a run to belong to
+        /// but no registered generation to act on.
+        var expectsGeneration = false
+    }
 
-    func reserve(_ id: UUID) -> Bool {
-        state.withLock { entry in
-            guard entry == nil else { return false }
-            entry = Entry(id: id, task: nil)
-            return true
+    private let state = Mutex(State())
+
+    func reserve(_ id: UUID) -> Reservation {
+        state.withLock { state in
+            // Busy is decided first. A second, genuinely concurrent `generate`
+            // never starts a run, so it must not spend a cancel that was raised
+            // for the run already in flight.
+            guard state.entry == nil else { return .busy }
+            // Reaching `generate` closes the window: from here the cancel that
+            // ends this run is the one that finds it registered, and anything
+            // arriving after it ends belongs to no run at all.
+            state.expectsGeneration = false
+            // The single clear point. A pending cancel belongs to the run that
+            // was starting when Stop was pressed, and this is that run, so
+            // consuming it here spends it on that run and on no other.
+            if state.pendingCancel {
+                state.pendingCancel = false
+                return .cancelled
+            }
+            state.entry = Entry(id: id, task: nil)
+            return .reserved
         }
     }
 
     func attach(_ task: Task<Void, Never>, to id: UUID) {
-        let shouldCancel = state.withLock { entry -> Bool in
-            guard entry?.id == id else { return true }
-            entry?.task = task
+        let shouldCancel = state.withLock { state -> Bool in
+            guard state.entry?.id == id else { return true }
+            state.entry?.task = task
             return false
         }
         if shouldCancel { task.cancel() }
     }
 
     func take(_ id: UUID) -> Task<Void, Never>? {
-        state.withLock { entry in
-            guard entry?.id == id else { return nil }
-            defer { entry = nil }
-            return entry?.task
+        state.withLock { state in
+            guard state.entry?.id == id else { return nil }
+            let task = state.entry?.task
+            state.entry = nil
+            return task
         }
     }
 
+    /// Ends the registered generation without arming anything. For callers that
+    /// are tearing a session down rather than answering a Stop: there is no run
+    /// their request belongs to, so it must not be held against the next one.
     func takeCurrent() -> Task<Void, Never>? {
-        state.withLock { entry in
-            defer { entry = nil }
-            return entry?.task
+        state.withLock { state in
+            let task = state.entry?.task
+            state.entry = nil
+            return task
+        }
+    }
+
+    /// Ends the registered generation, or — when the cancel beats `generate` to
+    /// the registry — arms the run that is starting to be cancelled before it
+    /// runs.
+    func cancelCurrentOrArmNext() -> Task<Void, Never>? {
+        state.withLock { state in
+            guard state.entry != nil else {
+                // Held only inside the window a starting run opened. Outside
+                // it this cancel followed a run that has already ended — the
+                // decode service delivers such a cancel out of band, after its
+                // generation is over — and holding it would kill the next run.
+                if state.expectsGeneration { state.pendingCancel = true }
+                return nil
+            }
+            let task = state.entry?.task
+            state.entry = nil
+            return task
         }
     }
 
     func clear(_ id: UUID) {
-        state.withLock { entry in
-            if entry?.id == id { entry = nil }
+        state.withLock { state in
+            if state.entry?.id == id { state.entry = nil }
+        }
+    }
+
+    /// Opens the window in which a cancel is held for the run that is starting.
+    func expectGeneration() {
+        state.withLock { state in state.expectsGeneration = true }
+    }
+
+    /// Closes the window for an announced run that will never reach `reserve` —
+    /// one the service refused before generating. The window is the only thing
+    /// that makes a cancel holdable, so leaving it open would let the next
+    /// stray cancel arm itself against a run that is never coming, and the run
+    /// after that would be the one to pay for it.
+    func abandonExpectedGeneration() {
+        state.withLock { state in
+            state.expectsGeneration = false
+            state.pendingCancel = false
         }
     }
 
@@ -80,16 +156,34 @@ public final class RealInferenceClient: AppModelLifecycleClient, @unchecked Send
     }
 
     public func unload() async {
+        // Not `cancel()`: tearing the session down is not a Stop, so an
+        // in-flight generation is ended without arming anything for the run
+        // that follows the next load.
+        generationTasks.takeCurrent()?.cancel()
         await session.unload()
     }
 
     public func generate(_ request: AppGenerationRequest) -> AsyncThrowingStream<AppInferenceEvent, Error> {
         AsyncThrowingStream { continuation in
             let generationID = UUID()
-            guard generationTasks.reserve(generationID) else {
+            switch generationTasks.reserve(generationID) {
+            case .cancelled:
+                // Stop was pressed before this stream existed — in the app while
+                // the run task was still being spawned, in the decode service
+                // while the generate command sat in the command queue. Nothing
+                // is registered to cancel at that moment, so the cancel waits
+                // here instead of being dropped, and the run ends without
+                // touching the session.
+                continuation.yield(.cancelled(.cancelledBeforeGeneration(
+                    runtimeOptions: request.runtimeOptions)))
+                continuation.finish(throwing: AppInferenceError.cancelled)
+                return
+            case .busy:
                 continuation.yield(.failed(.generationInFlight, partial: nil))
                 continuation.finish(throwing: AppInferenceError.generationInFlight)
                 return
+            case .reserved:
+                break
             }
             let task = Task { [self] in
                 await session.run(request: request,
@@ -106,7 +200,17 @@ public final class RealInferenceClient: AppModelLifecycleClient, @unchecked Send
     }
 
     public func cancel() {
-        generationTasks.takeCurrent()?.cancel()
+        generationTasks.cancelCurrentOrArmNext()?.cancel()
+    }
+
+    public func expectGeneration() {
+        generationTasks.expectGeneration()
+    }
+
+    /// For the decode service, which announces a generation as soon as the
+    /// frame arrives and may then refuse it without ever calling `generate`.
+    public func abandonExpectedGeneration() {
+        generationTasks.abandonExpectedGeneration()
     }
 
 }
