@@ -2,7 +2,9 @@ import TurboFieldfareAppCore
 import SwiftUI
 
 struct ErrorBanner: View {
-    @Bindable var model: AppModel
+    // Not `@Bindable`: the banner reads the resolved error and dismisses through
+    // the model, so it needs no two-way binding into it.
+    let model: AppModel
 
     var body: some View {
         if let error = model.error, error != .cancelled {
@@ -14,7 +16,7 @@ struct ErrorBanner: View {
                     .lineLimit(2)
                 Spacer(minLength: 8)
                 Button {
-                    model.error = nil
+                    model.dismissError()
                 } label: {
                     Label("Dismiss error", systemImage: "xmark")
                         .labelStyle(.iconOnly)

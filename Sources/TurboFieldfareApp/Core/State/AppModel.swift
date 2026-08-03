@@ -12,18 +12,44 @@ public final class AppModel {
     }
 
     public var modelPathText: String
-    /// The composer's text. Cleared at exactly one place — the point in `run()`
-    /// where the request is accepted — so a sent prompt does not linger as if it
-    /// were still unsent, a refused send never destroys what the user typed, and
-    /// a prompt typed while an answer streams survives the terminal event. The
-    /// sent copy lives on in `outputPromptText` and then in the committed turns.
-    /// The single path back is `restoreSubmittedPromptIfComposerIsEmpty()`, which
-    /// a cancelled or failed run uses because it commits no turn.
+    /// Composer text per conversation, held in memory only.
+    ///
+    /// Deliberately not a field on the persisted `Conversation`: that changes
+    /// the stored schema, and a draft changes on every keystroke with no
+    /// app-termination hook to flush on, so persisting it means either writing
+    /// the whole store per character or losing the tail of what was typed. A
+    /// draft therefore does not survive relaunch.
+    ///
+    /// An empty draft is stored as no entry at all, and a deleted conversation's
+    /// entry is dropped, so this cannot grow past the conversations that exist.
+    private var drafts: [UUID: String] = [:]
+    /// The composer's text for the conversation on screen.
+    ///
+    /// One composer serving every chat was the bug: text typed in one
+    /// conversation stayed in the box across a switch, so ⌘↩ delivered it into
+    /// a different conversation. Reading and writing the active conversation's
+    /// draft keeps every existing reader — `canRun`, `makeRequest`, the composer
+    /// binding, the examples card — meaning "what the user typed *here*", and
+    /// makes sending A's prompt from B impossible rather than merely unlikely.
+    ///
+    /// Cleared at exactly one place — the point in `run()` where the request is
+    /// accepted — so a sent prompt does not linger as if it were still unsent, a
+    /// refused send never destroys what the user typed, and a prompt typed while
+    /// an answer streams survives the terminal event. The sent copy lives on in
+    /// `outputPromptText` and then in the committed turns. The single path back
+    /// is `restoreSubmittedPromptIfComposerIsEmpty()`, which a cancelled or
+    /// failed run uses because it commits no turn.
     ///
     /// Because of that, an empty composer no longer implies "nothing has been
     /// sent yet" — anything wanting that older meaning must ask
     /// `isPromptExamplesCardVisible` instead.
-    public var promptText: String = ""
+    public var promptText: String {
+        get { activeConversationID.flatMap { drafts[$0] } ?? "" }
+        set {
+            guard let activeConversationID else { return }
+            drafts[activeConversationID] = newValue.isEmpty ? nil : newValue
+        }
+    }
     /// The in-flight exchange. Committed turns live in `activeConversation`;
     /// these two hold the turn being generated right now, so the transcript's
     /// committed prefix stays immutable while tokens stream in.
@@ -44,7 +70,27 @@ public final class AppModel {
     public var topPEnabled: Bool = true
     public var topP: Double = 0.95
     public var diagnostics: AppDiagnostics?
-    public var error: AppInferenceError?
+    /// A failure that blocks every conversation equally — a model load, an
+    /// install, or the runtime itself. Set only through `setGlobalError`.
+    private var globalError: AppInferenceError?
+    /// Failures owned by the conversation whose run produced them, keyed by
+    /// conversation. One slot for N chats meant a second failure erased the
+    /// first chat's banner for good; a per-conversation slot cannot.
+    private var conversationErrors: [UUID: AppInferenceError] = [:]
+
+    /// The failure to show for the conversation on screen.
+    ///
+    /// The global one wins while it is present: it blocks this conversation too,
+    /// so it is the message the user has to act on first. A conversation's own
+    /// failure is not destroyed by it — it reappears once the global one is
+    /// cleared or dismissed.
+    ///
+    /// Read-only on purpose. Scope is decided at the point a failure is raised,
+    /// never inferred from the case, so callers use `setGlobalError` or
+    /// `setRunError(_:for:)`; the UI dismisses through `dismissError()`.
+    public var error: AppInferenceError? {
+        globalError ?? activeConversationID.flatMap { conversationErrors[$0] }
+    }
     /// Mirrored into `installStates` on every write so the picker's per-row
     /// progress stays in step with the single-model state the existing install
     /// UI reads, without duplicating the assignment at each transition.
@@ -85,6 +131,11 @@ public final class AppModel {
     private var installGeneration: UInt64 = 0
     private var pendingExplicitLoadRuntimeKey: AppLoadedRuntimeKey?
     private var activeRunRuntimeKey: AppLoadedRuntimeKey?
+    /// The conversation that owns the run in flight, captured when the request
+    /// is accepted. A cancelled or failed run gives its prompt and its error
+    /// back to the conversation that started it, not to whichever conversation
+    /// happens to be on screen when the run ends.
+    private var runConversationID: UUID?
     private var hasHandledTerminalEvent = false
     private let memorySampler: AppMemorySampler
     private let settingsPersistenceEnabled: Bool
@@ -161,6 +212,11 @@ public final class AppModel {
                 for: selectedRepoID)
         }
     }
+
+    /// How many conversations are holding a draft. Internal because no view
+    /// wants it, but dropping a deleted conversation's draft is otherwise
+    /// unobservable: that conversation can never be selected again.
+    var draftedConversationCount: Int { drafts.count }
 
     public var isRunning: Bool { runState == .running }
 
@@ -461,7 +517,11 @@ public final class AppModel {
         loadedRuntimeKey = nil
         loadState = .notLoaded
         diagnostics = nil
-        error = nil
+        // Every failure on screen was about the model being replaced or was
+        // produced by it, and the conversations themselves may have been
+        // reloaded from a different store, so none of them survive.
+        setGlobalError(nil)
+        conversationErrors.removeAll()
         phase = .idle
         installationStatus = AppModelInstallationProbe.status(at: URL(fileURLWithPath: path))
         refreshInstallReadiness()
@@ -515,7 +575,9 @@ public final class AppModel {
         loadGeneration &+= 1
         let generation = loadGeneration
         pendingExplicitLoadRuntimeKey = runtimeKey
-        error = nil
+        // Only the model-scoped banner: a conversation's run failure is not
+        // about this load and is not this load's to erase.
+        setGlobalError(nil)
         loadState = .loading(.validatingDirectory)
         loadTask = Task.detached { [weak self, lifecycle, pendingUnload] in
             do {
@@ -656,7 +718,8 @@ public final class AppModel {
         case .alreadyLoaded:
             return
         case .blockedByGeneration:
-            error = .generationInFlight
+            // About the model picker, which is app-wide chrome.
+            setGlobalError(.generationInFlight)
             return
         case .busy:
             return
@@ -674,7 +737,7 @@ public final class AppModel {
     /// an uninstalled entry and then download it.
     private func selectModel(_ entry: ModelCatalogEntry) {
         guard let directory = try? AppModelLocation.defaultURL(forRepoID: entry.repoID) else {
-            error = .invalidRequest("Invalid repository ID: \(entry.repoID)")
+            setGlobalError(.invalidRequest("Invalid repository ID: \(entry.repoID)"))
             return
         }
         if loadState.isReady { unloadModel() }
@@ -699,7 +762,7 @@ public final class AppModel {
     /// be re-downloaded without retyping the repository.
     public func deleteInstall(for entry: ModelCatalogEntry) {
         guard !(selectedRepoID == entry.repoID && loadState.isReady) else {
-            error = .invalidRequest("Unload \(entry.displayName) before deleting it.")
+            setGlobalError(.invalidRequest("Unload \(entry.displayName) before deleting it."))
             return
         }
         guard let directory = try? AppModelLocation.defaultURL(forRepoID: entry.repoID) else {
@@ -716,8 +779,8 @@ public final class AppModel {
         } catch {
             // Never silent: losing weights is the most expensive thing this app
             // can do to a user, so a failure has to be visible.
-            self.error = .invalidRequest(
-                "Could not delete \(entry.displayName): \(error.localizedDescription)")
+            setGlobalError(.invalidRequest(
+                "Could not delete \(entry.displayName): \(error.localizedDescription)"))
             return
         }
         installStates.setState(.idle, for: entry.repoID)
@@ -983,7 +1046,8 @@ public final class AppModel {
             _ = seconds
         case .failed(let loadError):
             pendingExplicitLoadRuntimeKey = nil
-            error = loadError
+            // A model that will not load blocks every conversation.
+            setGlobalError(loadError)
         }
     }
 
@@ -999,6 +1063,10 @@ public final class AppModel {
         // Never accumulate empty chats: reuse the active one if it is untouched.
         if let active = activeConversation, active.isEmpty {
             resetLiveTurn()
+            // Reuse means this is also the "Clear output" path, which has to
+            // clear the banner of the conversation it is emptying. The fresh
+            // branch below cannot need it: a new id has no failure yet.
+            clearActiveConversationError()
             return
         }
         let conversation = Conversation()
@@ -1020,6 +1088,10 @@ public final class AppModel {
             return
         }
         conversations.remove(at: index)
+        // The conversation is gone and can never be selected again, so its
+        // draft and its failure go with it rather than sitting in memory.
+        drafts[id] = nil
+        conversationErrors[id] = nil
         if activeConversationID == id {
             activeConversationID = conversationsByRecency.first?.id
             resetLiveTurn()
@@ -1046,17 +1118,52 @@ public final class AppModel {
         persistConversations()
     }
 
+    /// Discards the live turn. Says nothing about errors: a conversation's
+    /// failure belongs to that conversation and outlives a switch, so the
+    /// callers that really are clearing a conversation say so themselves.
     private func resetLiveTurn() {
         outputPromptText = ""
         outputText = ""
         generationTranscriptMailbox?.reset()
         diagnostics = nil
-        error = nil
         isContextOverflowNoticeVisible = false
     }
 
     public func dismissContextOverflowNotice() {
         isContextOverflowNoticeVisible = false
+    }
+
+    // MARK: - Errors
+
+    /// Records a failure that blocks every conversation: a model load, an
+    /// install, or the runtime. Pass `nil` to clear it.
+    func setGlobalError(_ error: AppInferenceError?) {
+        globalError = error
+    }
+
+    /// Records a failure produced by one conversation's run. Pass `nil` to clear
+    /// that conversation's failure.
+    func setRunError(_ error: AppInferenceError?, for conversationID: UUID?) {
+        guard let conversationID else { return }
+        conversationErrors[conversationID] = error
+    }
+
+    /// Clears the failure this conversation's own run produced. Not the global
+    /// one: a model or install failure is not this conversation's to clear, and
+    /// still applies once the transcript is gone.
+    private func clearActiveConversationError() {
+        setRunError(nil, for: activeConversationID)
+    }
+
+    /// Dismisses the failure currently on screen. When a conversation's own
+    /// failure is hidden behind a global one, dismissing the global one reveals
+    /// it — each dismissal dismisses the message it was aimed at.
+    public func dismissError() {
+        if globalError != nil {
+            globalError = nil
+            return
+        }
+        clearActiveConversationError()
     }
 
     /// Conversations live in one global store rather than inside a model
@@ -1070,6 +1177,11 @@ public final class AppModel {
         if conversations.isEmpty {
             conversations = [Conversation()]
         }
+        // A reload replaces the whole set, and a model switch reads a different
+        // store, so drafts keyed by conversations that are no longer here would
+        // never be reachable or released again.
+        let liveIDs = Set(conversations.map(\.id))
+        drafts = drafts.filter { liveIDs.contains($0.key) }
         activeConversationID = conversationsByRecency.first?.id
     }
 
@@ -1119,11 +1231,11 @@ public final class AppModel {
         do {
             request = try makeRequest()
         } catch let appError as AppInferenceError {
-            error = appError
+            // A refused send belongs to the conversation it was sent from.
+            setRunError(appError, for: activeConversationID)
             return
         } catch {
-            let appError = AppInferenceError.unknown("\(error)")
-            self.error = appError
+            setRunError(.unknown("\(error)"), for: activeConversationID)
             return
         }
         persistSettings()
@@ -1135,7 +1247,14 @@ public final class AppModel {
         promptText = ""
         outputText = ""
         diagnostics = nil
-        error = nil
+        // Whose run this is, for the terminal paths that have to give the prompt
+        // and any failure back to the conversation that started it.
+        runConversationID = activeConversationID
+        // A fresh send clears the banner: this conversation's own last failure
+        // is what is being retried, and a global one the user has since worked
+        // past should not sit over the answer they just asked for.
+        setRunError(nil, for: runConversationID)
+        setGlobalError(nil)
         hasHandledTerminalEvent = false
         activeRunRuntimeKey = AppLoadedRuntimeKey(
             modelDirectory: request.modelDirectory,
@@ -1234,9 +1353,16 @@ public final class AppModel {
         hasHandledTerminalEvent = true
         materializeServiceTranscript()
         self.diagnostics = diagnostics
-        error = .cancelled
+        setRunError(.cancelled, for: runOwnerConversationID)
         restoreSubmittedPromptIfComposerIsEmpty()
         finishTerminalRun()
+    }
+
+    /// The conversation a terminal event belongs to. Falls back to the one on
+    /// screen only when no run was recorded, which happens when a caller drives
+    /// `apply` directly rather than through `run()`.
+    private var runOwnerConversationID: UUID? {
+        runConversationID ?? activeConversationID
     }
 
     /// Puts the submitted prompt back in the composer after a terminal path that
@@ -1257,9 +1383,15 @@ public final class AppModel {
     /// same way `canRun` measures it — trimmed — because a composer holding only
     /// a stray space the user tapped mid-stream has nothing worth keeping, and
     /// treating it as occupied would discard the submitted prompt instead.
+    ///
+    /// The restore targets the conversation that started the run, not the
+    /// composer on screen: the prompt is that conversation's, and writing it
+    /// anywhere else would hand one chat's text to another.
     private func restoreSubmittedPromptIfComposerIsEmpty() {
-        guard promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        promptText = outputPromptText
+        guard let owner = runOwnerConversationID else { return }
+        let draft = drafts[owner] ?? ""
+        guard draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        drafts[owner] = outputPromptText.isEmpty ? nil : outputPromptText
     }
 
     private func materializeServiceTranscript() {
@@ -1270,7 +1402,9 @@ public final class AppModel {
     private func finishWithError(_ appError: AppInferenceError) {
         guard !hasHandledTerminalEvent else { return }
         hasHandledTerminalEvent = true
-        error = appError
+        // The run failed, not the app: the failure belongs to the conversation
+        // that asked for it, and no other conversation's banner is touched.
+        setRunError(appError, for: runOwnerConversationID)
         restoreSubmittedPromptIfComposerIsEmpty()
         finishTerminalRun()
     }
@@ -1285,6 +1419,7 @@ public final class AppModel {
         runState = .idle
         isCancellationPending = false
         activeRunRuntimeKey = nil
+        runConversationID = nil
         runTask = nil
     }
 
