@@ -369,20 +369,36 @@ private struct ConfigScope {
     // else, so coerce it" are different situations, and only the first is a
     // decision anyone made.
 
+    /// The value at `k`, treating an explicit JSON `null` as absent.
+    ///
+    /// `JSONSerialization` decodes `null` to `NSNull()`, which is not `nil`, so
+    /// a bare `values[k] == nil` test would send `"key": null` to the strict
+    /// reader and throw. Upstream configs use `null` to mean "unset" — the same
+    /// thing as omitting the key — so it takes the documented default instead.
+    ///
+    /// This is deliberately the opposite of how `manifest.json` treats an
+    /// explicit null in its `family` key. That file is written by this package
+    /// and read back by it, so a null there is malformed and is rejected; a
+    /// `config.json` is someone else's file and follows their convention.
+    private func presentValue(_ k: String) -> Any? {
+        let raw = values[k]
+        return raw is NSNull ? nil : raw
+    }
+
     func optionalDouble(_ k: String) throws -> Double? {
-        values[k] == nil ? nil : try double(k)
+        presentValue(k) == nil ? nil : try double(k)
     }
 
     func optionalBool(_ k: String) throws -> Bool? {
-        values[k] == nil ? nil : try bool(k)
+        presentValue(k) == nil ? nil : try bool(k)
     }
 
     func optionalString(_ k: String) throws -> String? {
-        values[k] == nil ? nil : try string(k)
+        presentValue(k) == nil ? nil : try string(k)
     }
 
     func optionalStringArray(_ k: String) throws -> [String]? {
-        guard let raw = values[k] else { return nil }
+        guard let raw = presentValue(k) else { return nil }
         guard let v = raw as? [String] else {
             throw invalid("\(k) is not an array of strings")
         }
@@ -394,7 +410,7 @@ private struct ConfigScope {
     /// `rope_parameters` still falls through to the per-key defaults instead of
     /// failing. A key that is present but is not an object still throws.
     func scopeOrEmpty(_ k: String) throws -> ConfigScope {
-        guard let raw = values[k] else { return ConfigScope(values: [:], path: path) }
+        guard let raw = presentValue(k) else { return ConfigScope(values: [:], path: path) }
         guard let v = raw as? [String: Any] else {
             throw invalid("\(k) is not an object")
         }

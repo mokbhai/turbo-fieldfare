@@ -6,12 +6,13 @@
 // `Package.swift` gives `TurboFieldfare` and `TurboFieldfareRepackCore` no
 // dependency edge in either direction — the repacker writes `manifest.json`,
 // the runtime reads it, and the file format is the only contract between them.
-// Adding an edge just to share three declarations would also change
-// `TurboFieldfareAppCore`, which already imports both targets (non-`@testable`);
-// a single visible `ArchFamily` there would start resolving through a target
-// that has no business being in the app's import graph, and a third shared
-// module would cost a new target in every dependency list for declarations that
-// change once per architecture.
+// Sharing them would need a `TurboFieldfareRepackCore -> TurboFieldfare` edge,
+// which drags swift-transformers and the whole Metal runtime into a
+// command-line repacker that needs neither — for the sake of three
+// declarations that change once per architecture. A third shared module would
+// instead cost a new target in every dependency list. Note the RepackCore copy
+// is `internal`, so it cannot make a bare `ArchFamily` ambiguous anywhere; the
+// cost of sharing is dependency weight, not name resolution.
 //
 // The copies are held together by `ArchFamilyCrossTargetTests`, which compares
 // the case list and the stored-property names structurally, because `==` cannot
