@@ -130,9 +130,7 @@ import Testing
         model.maxNewTokensOverride = 4
         model.run()
 
-        for _ in 0..<200 where model.isRunning {
-            try? await Task.sleep(nanoseconds: 5_000_000)
-        }
+        await waitUntilIdle(model)
 
         #expect(!model.isRunning)
         #expect(model.viewedConversationPlainText.contains("alpha beta"))
@@ -248,10 +246,7 @@ import Testing
         #expect(model.promptText.isEmpty)
 
         model.promptText = "typed during run"
-        for _ in 0..<200 where model.liveTokenCount == 0 {
-            try? await Task.sleep(nanoseconds: 5_000_000)
-        }
-        // A poll that times out would leave this asserting a pre-decode state.
+        await waitUntil("the run emits its first token") { model.liveTokenCount > 0 }
         #expect(model.liveTokenCount > 0)
         model.cancel()
         await waitForIdle(model)
@@ -303,9 +298,7 @@ import Testing
         model.run()
         #expect(model.promptText.isEmpty)
 
-        for _ in 0..<200 where model.liveTokenCount == 0 {
-            try? await Task.sleep(nanoseconds: 5_000_000)
-        }
+        await waitUntil("the run emits its first token") { model.liveTokenCount > 0 }
         #expect(model.liveTokenCount > 0)
         model.cancel()
         await waitForIdle(model)
@@ -375,9 +368,7 @@ import Testing
         #expect(model.isRunning)
         #expect(!model.isPromptExamplesCardVisible)
 
-        for _ in 0..<200 where model.liveTokenCount == 0 {
-            try? await Task.sleep(nanoseconds: 5_000_000)
-        }
+        await waitUntil("the run emits its first token") { model.liveTokenCount > 0 }
         #expect(model.liveTokenCount > 0)
         #expect(!model.isPromptExamplesCardVisible)
     }
@@ -405,9 +396,7 @@ import Testing
         let cancelled = readyModel(client: cancelledClient)
         cancelled.promptText = "a question"
         cancelled.run()
-        for _ in 0..<200 where cancelled.liveTokenCount == 0 {
-            try? await Task.sleep(nanoseconds: 5_000_000)
-        }
+        await waitUntil("the run emits its first token") { cancelled.liveTokenCount > 0 }
         #expect(cancelled.liveTokenCount > 0)
         cancelled.cancel()
         await waitForIdle(cancelled)
@@ -507,9 +496,7 @@ import Testing
         model.maxNewTokensOverride = 10
         model.run()
 
-        for _ in 0..<200 where model.liveTokenCount == 0 {
-            try? await Task.sleep(nanoseconds: 5_000_000)
-        }
+        await waitUntil("the run emits its first token") { model.liveTokenCount > 0 }
 
         #expect(model.liveTokenCount > 0)
         model.cancel()
@@ -541,9 +528,7 @@ import Testing
         model.promptText = "prefill prompt"
         model.run()
 
-        for _ in 0..<200 where model.livePrefillDone == 0 {
-            try? await Task.sleep(nanoseconds: 5_000_000)
-        }
+        await waitUntil("prefill reports progress") { model.livePrefillDone > 0 }
 
         #expect(model.outputPromptText == "prefill prompt")
         model.cancel()
@@ -610,9 +595,8 @@ import Testing
     }
 
     @MainActor
-    private func waitForIdle(_ model: AppModel) async {
-        for _ in 0..<200 where model.isRunning {
-            try? await Task.sleep(nanoseconds: 5_000_000)
-        }
+    private func waitForIdle(_ model: AppModel,
+                             sourceLocation: SourceLocation = #_sourceLocation) async {
+        await waitUntilIdle(model, sourceLocation: sourceLocation)
     }
 }

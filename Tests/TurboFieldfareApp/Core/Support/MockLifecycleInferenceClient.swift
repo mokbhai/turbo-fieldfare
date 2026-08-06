@@ -1,4 +1,5 @@
 import Foundation
+import Testing
 @testable import TurboFieldfareAppCore
 
 final class MockLifecycleInferenceClient: AppModelLifecycleClient, @unchecked Sendable {
@@ -107,24 +108,47 @@ final class MockLifecycleInferenceClient: AppModelLifecycleClient, @unchecked Se
         return ensureLoadedCalls.count
     }
 
-    func waitForUnloadStart() async {
-        for _ in 0..<200 {
-            if unloadHasStarted { return }
-            try? await Task.sleep(nanoseconds: 5_000_000)
+    /// Wall clock, and it reports its own expiry.
+    ///
+    /// These three waits used to be `for _ in 0..<200 { ...sleep(5ms) }` with
+    /// no failure on running out, which is the same pair of defects
+    /// `Tests/TurboFieldfareApp/Core/Support/WaitUntil.swift` documents: an
+    /// iteration budget is worth about a second idle and far less under a
+    /// loaded scheduler, and falling out silently leaves the caller's next
+    /// `#expect` to fail on stale state and blame the wrong thing.
+    private func wait(_ what: String,
+                      sourceLocation: SourceLocation,
+                      until condition: () -> Bool) async {
+        let deadline = ContinuousClock.now + .seconds(30)
+        while !condition() {
+            guard ContinuousClock.now < deadline else {
+                Issue.record("timed out waiting until \(what)",
+                             sourceLocation: sourceLocation)
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(2))
         }
     }
 
-    func waitForLoadStart(_ expected: Int = 1) async {
-        for _ in 0..<200 {
-            if loadStartCount >= expected { return }
-            try? await Task.sleep(nanoseconds: 5_000_000)
+    func waitForUnloadStart(sourceLocation: SourceLocation = #_sourceLocation) async {
+        await wait("an unload starts", sourceLocation: sourceLocation) {
+            unloadHasStarted
         }
     }
 
-    func waitForEnsureLoadedCallCount(_ expected: Int) async {
-        for _ in 0..<200 {
-            if ensureLoadedCallCount() >= expected { return }
-            try? await Task.sleep(nanoseconds: 5_000_000)
+    func waitForLoadStart(_ expected: Int = 1,
+                          sourceLocation: SourceLocation = #_sourceLocation) async {
+        await wait("\(expected) load(s) have started",
+                   sourceLocation: sourceLocation) {
+            loadStartCount >= expected
+        }
+    }
+
+    func waitForEnsureLoadedCallCount(_ expected: Int,
+                                      sourceLocation: SourceLocation = #_sourceLocation) async {
+        await wait("ensureLoaded has been called \(expected) time(s)",
+                   sourceLocation: sourceLocation) {
+            ensureLoadedCallCount() >= expected
         }
     }
 

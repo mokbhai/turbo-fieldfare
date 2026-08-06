@@ -339,13 +339,22 @@ import TurboFieldfareRepackCore
     }
   }
 
+  /// Wall clock, not an iteration count. 200 x 5 ms is about a second while
+  /// the machine is idle and a great deal less work than that while it is not,
+  /// so the budget has to be a duration for it to mean the same thing under
+  /// both test invocations. See
+  /// `Tests/TurboFieldfareApp/Core/Support/WaitUntil.swift`.
   @MainActor
-  private func waitUntil(_ predicate: @escaping @MainActor () -> Bool) async throws {
-    for _ in 0..<200 {
-      if predicate() { return }
-      try await Task.sleep(for: .milliseconds(5))
+  private func waitUntil(_ predicate: @escaping @MainActor () -> Bool,
+                         sourceLocation: SourceLocation = #_sourceLocation) async throws {
+    let deadline = ContinuousClock.now + .seconds(30)
+    while !predicate() {
+      guard ContinuousClock.now < deadline else {
+        Issue.record("timed out waiting for condition", sourceLocation: sourceLocation)
+        return
+      }
+      try await Task.sleep(for: .milliseconds(2))
     }
-    Issue.record("timed out waiting for condition")
   }
 
 }

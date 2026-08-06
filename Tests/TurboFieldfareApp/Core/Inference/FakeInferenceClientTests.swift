@@ -81,13 +81,21 @@ import Testing
     _ = first
   }
 
+  /// Wall clock, not an iteration count — see
+  /// `Tests/TurboFieldfareApp/Core/Support/WaitUntil.swift` for why the
+  /// difference decides whether this suite is stable under a loaded scheduler.
   @MainActor
-  private func waitForFakeClient(_ predicate: @escaping @MainActor () -> Bool) async throws {
-    for _ in 0..<200 {
-      if predicate() { return }
-      try await Task.sleep(for: .milliseconds(5))
+  private func waitForFakeClient(_ predicate: @escaping @MainActor () -> Bool,
+                                 sourceLocation: SourceLocation = #_sourceLocation) async throws {
+    let deadline = ContinuousClock.now + .seconds(30)
+    while !predicate() {
+      guard ContinuousClock.now < deadline else {
+        Issue.record("timed out waiting for fake client state",
+                     sourceLocation: sourceLocation)
+        return
+      }
+      try await Task.sleep(for: .milliseconds(2))
     }
-    Issue.record("timed out waiting for fake client state")
   }
 
 }

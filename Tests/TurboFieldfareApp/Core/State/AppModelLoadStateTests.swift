@@ -76,8 +76,8 @@ import Testing
         await client.waitForUnloadStart()
         #expect(model.loadState == .unloading)
         client.releaseUnloads()
-        for _ in 0..<200 where model.loadState != .notLoaded {
-            try? await Task.sleep(nanoseconds: 5_000_000)
+        await waitUntil("the unload settles back to notLoaded") {
+            model.loadState == .notLoaded
         }
         #expect(model.loadState == .notLoaded)
         #expect(model.outputText == "keep me")
@@ -94,9 +94,7 @@ import Testing
 
         model.loadModel()
         await client.waitForLoadStart()
-        for _ in 0..<200 where !model.canCancelLoad {
-            try? await Task.sleep(for: .milliseconds(5))
-        }
+        await waitUntil("the in-flight load becomes cancellable") { model.canCancelLoad }
         model.cancelLoad()
         await client.waitForUnloadStart()
         #expect(model.loadState == .cancelling)
@@ -106,8 +104,8 @@ import Testing
         #expect(model.loadState == .cancelling)
 
         client.releaseUnloads()
-        for _ in 0..<200 where model.loadState != .notLoaded {
-            try? await Task.sleep(for: .milliseconds(5))
+        await waitUntil("the cancelled load settles back to notLoaded") {
+            model.loadState == .notLoaded
         }
         #expect(model.loadState == .notLoaded)
     }
@@ -123,9 +121,7 @@ import Testing
         model.loadModel()
         await client.waitForLoadStart()
         client.failNextLoad(.modelLoadFailed("synthetic"))
-        for _ in 0..<200 where !model.loadState.isFailed {
-            try? await Task.sleep(for: .milliseconds(5))
-        }
+        await waitUntil("the load reports its failure") { model.loadState.isFailed }
         #expect(model.loadState == .failed(.modelLoadFailed("synthetic")))
         #expect(model.canLoadModel)
 
@@ -137,9 +133,7 @@ import Testing
         #expect(model.loadState.isLoading)
 
         client.releaseLoads()
-        for _ in 0..<200 where !model.loadState.isReady {
-            try? await Task.sleep(for: .milliseconds(5))
-        }
+        await waitUntil("the retried load becomes ready") { model.loadState.isReady }
         #expect(model.loadState.isReady)
         #expect(client.ensureLoadedCallCount() == 2)
     }

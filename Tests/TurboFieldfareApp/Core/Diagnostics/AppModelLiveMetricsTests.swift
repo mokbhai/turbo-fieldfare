@@ -59,9 +59,7 @@ import Testing
         #expect(model.liveElapsedDecodeSeconds == 0)
         #expect(model.livePrefillDone == 0)
         model.cancel()
-        for _ in 0..<200 where model.isRunning {
-            try? await Task.sleep(nanoseconds: 5_000_000)
-        }
+        await waitUntilIdle(model)
     }
 
     @MainActor
