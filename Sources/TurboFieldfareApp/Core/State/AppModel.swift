@@ -128,6 +128,24 @@ public final class AppModel {
     private var unloadTask: Task<Void, Never>?
     private var loadGeneration: UInt64 = 0
     private var unloadGeneration: UInt64 = 0
+    /// Which `run()` a streamed event belongs to. Bumped by every `run()`, in
+    /// the same shape as `loadGeneration`.
+    ///
+    /// `hasHandledTerminalEvent` is not enough on its own, and the gap is not
+    /// theoretical. **A failing stream signals terminally twice**: once as a
+    /// `.failed` event through `apply`, once as the thrown error through the
+    /// `catch` around the `for try await` — and each is a separate hop onto
+    /// this actor from the detached run task. The first already sets
+    /// `runState = .idle`, so from the instant it lands the model is idle and
+    /// the next `run()` may start; that `run()` clears
+    /// `hasHandledTerminalEvent`, and the *previous* run's second hop, still
+    /// queued behind it, is then handled as though it belonged to the new run
+    /// — filing the old failure against the new conversation and tearing the
+    /// new run down mid-flight. Whether the window is hit is decided entirely
+    /// by how busy this actor's queue is, which is why it showed up as an
+    /// intermittent conversation-scoping failure rather than as anything that
+    /// named a run boundary.
+    private var runGeneration: UInt64 = 0
     private var installGeneration: UInt64 = 0
     private var pendingExplicitLoadRuntimeKey: AppLoadedRuntimeKey?
     private var activeRunRuntimeKey: AppLoadedRuntimeKey?
@@ -1431,16 +1449,21 @@ public final class AppModel {
         phase = .prefill
         runState = .running
 
-        runTask = Task.detached { [weak self, client, request] in
+        // Everything this stream delivers is stamped with the run it came
+        // from, so a hop that arrives after the next `run()` has started is
+        // dropped instead of being applied to it. See `runGeneration`.
+        runGeneration &+= 1
+        let generation = runGeneration
+        runTask = Task.detached { [weak self, client, request, generation] in
             guard let self else { return }
             do {
                 for try await event in client.generate(request) {
-                    await self.apply(event)
+                    await self.apply(event, generation: generation)
                 }
             } catch let appError as AppInferenceError {
-                await self.finishStreamFailure(appError)
+                await self.finishStreamFailure(appError, generation: generation)
             } catch {
-                await self.finishStreamFailure(.unknown("\(error)"))
+                await self.finishStreamFailure(.unknown("\(error)"), generation: generation)
             }
         }
     }
@@ -1465,6 +1488,17 @@ public final class AppModel {
             runtimeOptions: runtimeOptions)
         try request.validate(requireModelDirectory: true)
         return request
+    }
+
+    /// `apply`, but only if the event still belongs to the current run.
+    ///
+    /// Applied to every event, not only the terminal ones: a `.token` from a
+    /// superseded run would append that run's text to the new run's output, and
+    /// a `.prefillProgress` would drive the new run's HUD backwards. The
+    /// terminal case is simply the one with a visible consequence.
+    func apply(_ event: AppInferenceEvent, generation: UInt64) {
+        guard generation == runGeneration else { return }
+        apply(event)
     }
 
     func apply(_ event: AppInferenceEvent) {
@@ -1590,6 +1624,13 @@ public final class AppModel {
         // that asked for it, and no other conversation's banner is touched.
         settleUncommittedLiveTurn(appError)
         finishTerminalRun()
+    }
+
+    /// The second of a failing stream's two terminal signals. Dropped when the
+    /// run it belongs to has already been superseded — see `runGeneration`.
+    func finishStreamFailure(_ appError: AppInferenceError, generation: UInt64) {
+        guard generation == runGeneration else { return }
+        finishStreamFailure(appError)
     }
 
     private func finishStreamFailure(_ appError: AppInferenceError) {

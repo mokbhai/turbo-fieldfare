@@ -25,8 +25,8 @@ import Testing
         #expect(!model.isGenerating(chatB))
         #expect(!model.isRunningInActiveConversation)
 
-        for _ in 0..<400 where model.liveTokenCount <= tokensAtSwitch {
-            try? await Task.sleep(nanoseconds: 5_000_000)
+        await waitUntil("the background chat streams another token") {
+            model.liveTokenCount > tokensAtSwitch
         }
         #expect(model.liveTokenCount > tokensAtSwitch)
 
@@ -497,9 +497,7 @@ import Testing
     private func startRun(_ model: AppModel, prompt: String) async {
         model.promptText = prompt
         model.run()
-        for _ in 0..<400 where model.liveTokenCount == 0 {
-            try? await Task.sleep(nanoseconds: 5_000_000)
-        }
+        await waitUntil("the run emits its first token") { model.liveTokenCount > 0 }
     }
 
     /// Gives a conversation committed turns so it is no longer eligible for the
@@ -515,9 +513,8 @@ import Testing
     }
 
     @MainActor
-    private func waitForIdle(_ model: AppModel) async {
-        for _ in 0..<400 where model.isRunning {
-            try? await Task.sleep(nanoseconds: 5_000_000)
-        }
+    private func waitForIdle(_ model: AppModel,
+                             sourceLocation: SourceLocation = #_sourceLocation) async {
+        await waitUntilIdle(model, sourceLocation: sourceLocation)
     }
 }

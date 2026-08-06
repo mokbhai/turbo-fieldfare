@@ -125,4 +125,58 @@ struct RepackPlannerTests {
             #expect(cursor == repackPlan.resident.totalSize)
         }
     }
+
+    /// **The fail-fast the BailingMoeV2 config parser silently removed.**
+    ///
+    /// `ArchInfo.load` used to reject Ling's `config.json` outright — it has no
+    /// `text_config` — so pointing the repacker at Ling failed at the first
+    /// file it read. Now it parses, and everything in this planner is written
+    /// against Gemma's tensor names: `classify` would refuse whichever Ling
+    /// tensor it visited first with `unknownTensorPrefix`, naming a tensor
+    /// instead of the decision, after the shard headers had been downloaded.
+    ///
+    /// The snapshot here is a real Gemma one, so the only thing that can refuse
+    /// the plan is the architecture argument — which is the point: the planner
+    /// must decide on the family before it looks at a tensor.
+    @Test func planningRefusesAnArchitectureItHasNoLayoutFor() throws {
+        let snapshotDirectory = GemmaFrozenPlan.temporaryRoot("unrepackable-snapshot")
+        let outputDirectory = GemmaFrozenPlan.temporaryRoot("unrepackable-output")
+        let configDirectory = GemmaFrozenPlan.temporaryRoot("unrepackable-config")
+        defer {
+            try? FileManager.default.removeItem(atPath: snapshotDirectory)
+            try? FileManager.default.removeItem(atPath: outputDirectory)
+            try? FileManager.default.removeItem(atPath: configDirectory)
+        }
+        let snapshot = try SyntheticSnapshot.build(at: snapshotDirectory)
+        let metadata = try IndexLoader.load(snapshotDir: snapshotDirectory)
+        let header = try GemmaFrozenPlan.parseHeader(realPath: snapshot.shardPath,
+                                                     shardID: GemmaFrozenPlan.shardID)
+        let ling = try ArchInfo.load(
+            configPath: try BailingSyntheticConfig.write(to: configDirectory))
+        #expect(ling.variant.family == .bailingMoeV2)
+
+        #expect {
+            _ = try RepackPlanner.plan(meta: metadata,
+                                       arch: ling,
+                                       shardHeaders: [header],
+                                       outputDir: outputDirectory)
+        } throws: { error in
+            guard case RepackError.configurationInvalid(let detail) = error else {
+                return false
+            }
+            // Specifically NOT `unknownTensorPrefix`: the refusal has to be
+            // about the architecture, not about whichever tensor came first.
+            return detail.contains("cannot repack architecture")
+                && detail.contains("bailingMoeV2")
+        }
+    }
+
+    /// The set the guard reads, pinned as a decision. Repackability and
+    /// executability are different capabilities — `ArchConfig.supported` is
+    /// about Metal kernels, this is about knowing a checkpoint's tensor
+    /// layout — so they get separate lists and will very plausibly gain Ling at
+    /// different times.
+    @Test func onlyGemmaIsRepackable() {
+        #expect(ArchInfo.repackableFamilies == [.gemma4])
+    }
 }

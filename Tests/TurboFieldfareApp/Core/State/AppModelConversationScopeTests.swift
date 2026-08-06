@@ -127,6 +127,65 @@ import Testing
         #expect(model.error?.userMessage == "failure in the second chat")
     }
 
+    /// **The regression behind this suite's intermittent failure.**
+    ///
+    /// A failing stream signals terminally twice — a `.failed` event through
+    /// `apply`, then the thrown error through the `catch` — and each is a
+    /// separate hop onto the main actor. The first hop already sets
+    /// `runState = .idle`, so the model looks finished while the second is
+    /// still queued. If the next `run()` starts in that gap it clears
+    /// `hasHandledTerminalEvent`, and the old run's second hop is then handled
+    /// as the new run's: the previous chat's failure is filed against the new
+    /// conversation and the in-flight run is torn down.
+    ///
+    /// It surfaced as `failuresInDifferentConversationsDoNotEraseEachOther`
+    /// reading "failure in the first chat" where the second belonged — an
+    /// accurate description of a scoping bug that was not there. Whether the
+    /// gap is hit is decided by how busy the main actor is, so it appeared only
+    /// under a parallel test run and never under `Scripts/test.sh`.
+    ///
+    /// Driven by hand rather than by racing the scheduler: the stale hop is
+    /// delivered at exactly the moment that used to be unreachable on purpose.
+    @MainActor
+    @Test func aSupersededRunsTerminalHopCannotLandOnTheNextRun() async throws {
+        let client = MockInferenceClient(response: "answer", tokenDelayNanos: 1)
+        let model = readyModel(client: client)
+        await commitOneExchange(model, prompt: "hello")
+
+        client.failureMessage = "failure in the first chat"
+        model.promptText = "retry first"
+        model.run()
+        await waitForIdle(model)
+        #expect(model.error?.userMessage == "failure in the first chat")
+
+        model.newConversation()
+        #expect(model.error == nil)
+
+        // A second run that will succeed, so anything this conversation ends up
+        // showing can only have come from the first one.
+        client.failureMessage = nil
+        model.promptText = "ask second"
+        model.run()
+        #expect(model.isRunning)
+
+        // The first run's still-queued terminal hop, arriving now. `0` is a
+        // generation every `run()` has already moved past.
+        model.finishStreamFailure(.unknown("failure in the first chat"), generation: 0)
+        #expect(model.isRunning, "a superseded run must not end the current one")
+        #expect(model.error == nil, "and must not file its failure against it")
+
+        // The same for a non-terminal event: a stray token from the old run
+        // would otherwise be appended to this run's answer.
+        model.apply(.token(AppTokenEvent(index: 99,
+                                         textDelta: "ghost",
+                                         elapsedDecodeSeconds: 0)),
+                    generation: 0)
+        #expect(!model.outputText.contains("ghost"))
+
+        await waitForIdle(model)
+        #expect(model.error == nil)
+    }
+
     @MainActor
     @Test func aModelLoadFailureShowsInEveryConversation() async throws {
         let model = readyModel(client: MockInferenceClient(response: "answer", tokenDelayNanos: 1))
@@ -212,10 +271,21 @@ import Testing
         await waitForIdle(model)
     }
 
+    /// See `waitUntil` for why this is a wall-clock budget that reports its own
+    /// expiry rather than a bounded iteration count that falls out silently.
+    ///
+    /// Worth being precise about what that did and did not fix. It was blamed
+    /// for this suite's intermittent parallel failure and it was not the cause:
+    /// the wait was returning legitimately, with `isRunning` false, and the
+    /// stale value came from `AppModel` — see
+    /// `aSupersededRunsTerminalHopCannotLandOnTheNextRun`. What the change is
+    /// worth is that the next such failure will say "timed out waiting until
+    /// the generation finishes" at the wait, instead of impersonating a
+    /// conversation-scoping bug three lines further down, which is what sent
+    /// the last investigation to the wrong file.
     @MainActor
-    private func waitForIdle(_ model: AppModel) async {
-        for _ in 0..<200 where model.isRunning {
-            try? await Task.sleep(nanoseconds: 5_000_000)
-        }
+    private func waitForIdle(_ model: AppModel,
+                             sourceLocation: SourceLocation = #_sourceLocation) async {
+        await waitUntilIdle(model, sourceLocation: sourceLocation)
     }
 }

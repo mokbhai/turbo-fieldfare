@@ -43,6 +43,7 @@ import Foundation
             "attentionKEqV",
             "fullAttentionLayerMask",
             "hiddenActivation",
+            "variant",
         ], "ArchConfig gained or lost a field; pin its Gemma value below")
 
         #expect(a.hiddenSize == 2816)
@@ -65,6 +66,11 @@ import Foundation
         #expect(a.tieWordEmbeddings == true)
         #expect(a.attentionKEqV == true)
         #expect(a.hiddenActivation == "gelu_pytorch_tanh")
+        // `.gemma4` has no payload by design: every Gemma fact is already a core
+        // field the runtime reads, and a second copy would be a second source of
+        // truth. What this pins is that Gemma is still the gemma4 variant, which
+        // is what `validateArch`'s family gate and the quant table key off.
+        #expect(a.variant == .gemma4)
 
         // Every sixth layer from 5 is full-attention; the rest are sliding. The
         // literal is spelled out rather than recomputed so the test cannot agree
@@ -90,5 +96,11 @@ import Foundation
         #expect(e2.description.contains("2"))
         let e3 = ModelError.checksumMismatch(file: "model_weights.bin")
         #expect(e3.description.contains("model_weights.bin"))
+        // Names the family AND says the shortfall is this build's, not the
+        // file's: a user told only "unsupported architecture" reasonably
+        // concludes their install is corrupt and reinstalls 15 GB.
+        let e4 = ModelError.architectureNotExecutable(family: "bailingMoeV2")
+        #expect(e4.description.contains("bailingMoeV2"))
+        #expect(e4.description.contains("no kernels"))
     }
 }

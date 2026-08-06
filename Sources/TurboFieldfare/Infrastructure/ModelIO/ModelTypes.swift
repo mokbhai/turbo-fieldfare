@@ -25,6 +25,11 @@ public struct ArchConfig: Sendable, Equatable {
     public let attentionKEqV: Bool
     public let fullAttentionLayerMask: [UInt8]
     public let hiddenActivation: String
+    /// Which architecture this describes, carrying the facts only that family
+    /// has. Everything above is a field both families genuinely populate; a
+    /// fact that exists for one family only belongs in the payload, never as a
+    /// fabricated value on a core field.
+    public let variant: ArchVariant
 
     public init(
         hiddenSize: Int,
@@ -47,7 +52,12 @@ public struct ArchConfig: Sendable, Equatable {
         tieWordEmbeddings: Bool,
         attentionKEqV: Bool,
         fullAttentionLayerMask: [UInt8],
-        hiddenActivation: String
+        hiddenActivation: String,
+        // Deliberately has no default. A defaulted `.gemma4` would let a
+        // future architecture's baseline compile while silently claiming to be
+        // Gemma, and `validateArch` would then compare Gemma's fields against
+        // values the other family never had.
+        variant: ArchVariant
     ) {
         self.hiddenSize = hiddenSize
         self.intermediateSize = intermediateSize
@@ -70,6 +80,7 @@ public struct ArchConfig: Sendable, Equatable {
         self.attentionKEqV = attentionKEqV
         self.fullAttentionLayerMask = fullAttentionLayerMask
         self.hiddenActivation = hiddenActivation
+        self.variant = variant
     }
 
     /// Canonical Gemma 4 26B-A4B baseline, checked against the installed
@@ -96,13 +107,103 @@ public struct ArchConfig: Sendable, Equatable {
         tieWordEmbeddings: true,
         attentionKEqV: true,
         fullAttentionLayerMask: Self.gemma4LayerMask(),
-        hiddenActivation: "gelu_pytorch_tanh"
+        hiddenActivation: "gelu_pytorch_tanh",
+        variant: .gemma4
+    )
+
+    /// `inclusionAI/Ling-mini-2.0`, consumed as `mlx-community/Ling-mini-2.0-4bit`.
+    ///
+    /// **Deliberately absent from `supported`.** This build ships no BailingMoeV2
+    /// kernels, and `supported` means "this build can execute these bytes": an
+    /// entry here without kernels lets the model install cleanly and then trap at
+    /// the first attention dispatch. It is added alongside the kernels, not before.
+    /// `ArchConfigLingTests.aRealLingInstallCannotLoadWithoutItsKernels` is the
+    /// guard: it asserts the consequence — the load is refused — rather than
+    /// which list the name appears in.
+    ///
+    /// `intermediateSize = 512` is the SHARED-EXPERT FFN width
+    /// (`moe_shared_expert_intermediate_size`), which is what this field means and
+    /// how the runtime consumes it. Ling's config also has a key literally named
+    /// `intermediate_size` = 5120, the dense layer-0 FFN width; that lives in
+    /// `BailingMoeV2Extras.denseIntermediateSize`. Putting 5120 here would silently
+    /// size the shared-expert GEMV ten times wrong.
+    ///
+    /// Ling draws no sliding/global distinction, so `numFullKVHeads`/`fullHeadDim`
+    /// mirror the head geometry and `slidingWindow`/`finalLogitSoftcap` are 0,
+    /// meaning "none". These are definite values, not placeholders:
+    /// `validateArch` compares all six for Ling too, and `numFullKVHeads` /
+    /// `fullHeadDim` are exactly the geometry a 100%-full-attention runtime path
+    /// reads, so an unchecked one would trap at dispatch rather than at load.
+    public static let lingMini2_0_4bit = ArchConfig(
+        hiddenSize: 2048,
+        intermediateSize: 512,
+        moeIntermediateSize: 512,
+        numHeads: 16,
+        numKVHeads: 4,
+        numFullKVHeads: 4,
+        headDim: 128,
+        fullHeadDim: 128,
+        vocabSize: 157184,
+        slidingWindow: 0,
+        finalLogitSoftcap: 0.0,
+        ropeTheta: 600_000.0,
+        fullRopeTheta: 600_000.0,
+        partialRotaryFactor: 0.5,
+        numLayers: 20,
+        numExperts: 256,
+        topKExperts: 8,
+        tieWordEmbeddings: false,
+        // Ling's K and V are distinct projections. The flag carries no safety on
+        // its own — the Gemma runner derives V from K for any full-attention
+        // layer without consulting it — which is why Ling needs its own forward
+        // path rather than a `false` here.
+        attentionKEqV: false,
+        // No sliding window and no `layer_types`: every layer is full attention.
+        fullAttentionLayerMask: [UInt8](repeating: 1, count: 20),
+        hiddenActivation: "silu",
+        variant: .bailingMoeV2(BailingMoeV2Extras(
+            denseIntermediateSize: 5120,
+            firstKDenseReplace: 1,
+            numSharedExperts: 1,
+            nGroup: 8,
+            topkGroup: 4,
+            routedScalingFactor: 2.5,
+            normTopkProb: true,
+            scoreFunction: "sigmoid",
+            routerEnableExpertBias: true,
+            useQKNorm: true))
     )
 
     /// Every architecture this build can execute. An entry here without the
     /// matching Metal kernels would let a model install and then trap at the
     /// first attention dispatch, so entries are added only alongside kernels.
+    /// `lingMini2_0_4bit` is defined above and stays out for exactly that reason.
     public static let supported: [ArchConfig] = [gemma4_26B_A4B]
+
+    /// The families this build has kernels for — derived from `supported`, never
+    /// listed by hand, so the two cannot disagree.
+    ///
+    /// **This, not `real`, is what the executability gate is keyed on.** Keying
+    /// it on membership in `real` refuses only the exact baselines this package
+    /// happens to have transcribed: a *different* BailingMoeV2 checkpoint —
+    /// another Ling size, a fine-tune with different dimensions — matches no
+    /// entry in `real`, so that gate never fires and the manifest is refused
+    /// only if some caller's baseline happens to disagree with it. What has to
+    /// hold is architectural: there are no BailingMoeV2 kernels in this binary,
+    /// so no BailingMoeV2 manifest is executable, whatever its dimensions.
+    public static let executableFamilies: Set<ArchFamily> =
+        Set(supported.map { $0.variant.family })
+
+    /// Every published checkpoint this package has a real baseline for, whether
+    /// or not this build ships kernels for it. `supported` is a subset.
+    ///
+    /// This is the list that decides whether `manifest.quant` is mandatory. A
+    /// real checkpoint's weights are quantized, so a manifest matching one of
+    /// these and carrying no `quant` block is incomplete — and without this
+    /// list, a real Ling install could skip the per-architecture bit-width table
+    /// entirely just by omitting the block, because Ling is deliberately not in
+    /// `supported` yet. Every entry needs its own `acceptedQuantBits` row.
+    public static let real: [ArchConfig] = [gemma4_26B_A4B, lingMini2_0_4bit]
 
     private static func gemma4LayerMask() -> [UInt8] {
         var mask = [UInt8](repeating: 0, count: 30)
@@ -137,7 +238,8 @@ extension ManifestArch {
             tieWordEmbeddings: config.tieWordEmbeddings,
             attentionKEqV: config.attentionKEqV,
             hiddenActivation: config.hiddenActivation,
-            fullAttentionLayerMask: config.fullAttentionLayerMask.map { Int($0) })
+            fullAttentionLayerMask: config.fullAttentionLayerMask.map { Int($0) },
+            variant: config.variant)
     }
 }
 
@@ -148,6 +250,12 @@ enum ModelError: Error, CustomStringConvertible, Equatable {
     case unsupportedVersion(major: Int, minor: Int)
     case unknownFlag(name: String)
     case archMismatch(field: String, expected: String, actual: String)
+    /// The manifest describes an architecture FAMILY this build has no kernels
+    /// for — any manifest of that family, not only the published checkpoint
+    /// this package happens to know the dimensions of. Distinct from
+    /// `archMismatch`: nothing is wrong with the file, and no other build would
+    /// reject it — this one simply cannot execute it.
+    case architectureNotExecutable(family: String)
     case expertStrideNotPageAligned(stride: UInt64, pageSize: Int)
     case missingFile(name: String)
     case checksumMismatch(file: String)
@@ -170,6 +278,8 @@ enum ModelError: Error, CustomStringConvertible, Equatable {
             return "manifest.flags contains unknown key \"\(n)\""
         case .archMismatch(let field, let exp, let act):
             return "manifest.arch.\(field) = \(act); expected \(exp)"
+        case .architectureNotExecutable(let family):
+            return "this build has no kernels for architecture \(family)"
         case .expertStrideNotPageAligned(let s, let p):
             return "expertStride \(s) is not a multiple of page size \(p)"
         case .missingFile(let n):

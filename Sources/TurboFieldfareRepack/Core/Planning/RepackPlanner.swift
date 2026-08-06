@@ -142,6 +142,11 @@ enum RepackPlanner {
                             arch: ArchInfo,
                             shardHeaders: [Safetensors.Header],
                             outputDir: String) throws -> RepackPlan {
+        // Everything below — `classify`, `lmResidentOrdering`, the gate/up/down
+        // bundling — is written against Gemma's tensor names. Refuse anything
+        // else here, where the assumption lives, rather than letting it surface
+        // as `unknownTensorPrefix` on whichever foreign tensor is visited first.
+        try arch.validateRepackable()
 
         // Companion tensors may live in different shards, so resolve them
         // through one global registry.

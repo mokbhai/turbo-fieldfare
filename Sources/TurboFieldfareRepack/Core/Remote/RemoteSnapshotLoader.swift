@@ -44,6 +44,13 @@ enum RemoteSnapshotLoader {
                                                         sha256: metadata.indexSha256Hex)
         }
         let arch = try ArchInfo.load(configPath: metadata.configPath)
+        // The fail-fast, immediately after the parse and BEFORE the per-shard
+        // header downloads below. `RepackPlanner.plan` refuses the same thing,
+        // but only after every shard header has been resolved and fetched — and
+        // a user who points the installer at an architecture this build cannot
+        // repack should be told so from `config.json`, not after the network
+        // round trips.
+        try arch.validateRepackable()
 
         var files: [String: RemoteFileInfo] = [
             indexInfo.filename: indexInfo,

@@ -186,6 +186,61 @@ struct RangeCopyPlannerTests {
         #expect(first.coalescedCopies.map(\.id) == second.coalescedCopies.map(\.id))
     }
 
+    /// **The plan must not depend on the order tensors arrive in.**
+    ///
+    /// `Safetensors.parseHeaderBytes` walks a JSON dictionary, so `header.tensors`
+    /// comes out in a hash-randomised order that differs between processes, and
+    /// `RepackPlanner.plan` iterates its own `[String: SourceTensor]` registry.
+    /// Everything downstream is meant to re-sort under a total order before it
+    /// can reach `canonicalFingerprint` — but "meant to" is an argument, and this
+    /// asserts it: same header, ten different input permutations, one
+    /// fingerprint.
+    ///
+    /// Written because the alternative diagnosis costs a day. A fingerprint that
+    /// moves with input order shows up as a golden that is red in a handful of
+    /// runs and green in the next twenty-five, and localising that to the planner
+    /// took ~300 whole-suite executions. This localises it to one run.
+    @Test func canonicalFingerprintDoesNotDependOnTensorOrder() throws {
+        let snapshotDirectory = temporaryRoot("shuffled-snapshot")
+        let output = temporaryRoot("shuffled-output")
+        defer {
+            try? FileManager.default.removeItem(atPath: snapshotDirectory)
+            try? FileManager.default.removeItem(atPath: output)
+        }
+        let snapshot = try SyntheticSnapshot.build(at: snapshotDirectory,
+                                                   seed: 0x5150_4e41)
+        let metadata = try IndexLoader.load(snapshotDir: snapshotDirectory)
+        let arch = try ArchInfo.load(
+            configPath: (snapshotDirectory as NSString).appendingPathComponent("config.json"))
+        let header = try parseHeader(path: snapshot.shardPath)
+        #expect(header.tensors.count > 1, "a single-tensor header cannot be shuffled")
+
+        func fingerprint(of tensors: [SourceTensor]) throws -> String {
+            let plan = try RepackPlanner.plan(meta: metadata,
+                                              arch: arch,
+                                              shardHeaders: [Safetensors.Header(tensors: tensors)],
+                                              outputDir: output)
+            return try RangeCopyPlanner.plan(repackPlan: plan,
+                                             rangeChunkBytes: 4096).canonicalFingerprint
+        }
+
+        let baseline = try fingerprint(of: header.tensors)
+        // Seeded, so a failure reproduces rather than being a story about a
+        // flake.
+        var rng = SplitMix64(seed: 0x0BAD_F00D)
+        for permutation in 0..<10 {
+            let shuffled = header.tensors.shuffled(using: &rng)
+            #expect(try fingerprint(of: shuffled) == baseline,
+                    """
+                    permutation \(permutation) produced a different plan \
+                    fingerprint. Some collection on the path from \
+                    RepackPlanner.plan to canonicalFingerprint is consuming its \
+                    input order instead of re-sorting under a total order — that \
+                    makes every resume checkpoint depend on the process hash seed.
+                    """)
+        }
+    }
+
     @Test func overlappingDestinationIntervalsAreRejected() throws {
         let root = temporaryRoot("overlap")
         defer { try? FileManager.default.removeItem(atPath: root) }

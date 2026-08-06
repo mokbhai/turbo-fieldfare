@@ -59,9 +59,7 @@ import Testing
             for try await _ in client.installDefaultModel(outputDirectory: output) {}
         }
 
-        for _ in 0..<200 where !started.value {
-            await Task.yield()
-        }
+        await waitUntil("the install request reaches the network") { started.value }
         #expect(started.value)
         client.cancel()
 

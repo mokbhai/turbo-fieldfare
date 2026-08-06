@@ -57,7 +57,8 @@ import Metal
                              tieWordEmbeddings: true,
                              attentionKEqV: true,
                              fullAttentionLayerMask: [0, 1],
-                             hiddenActivation: "gelu_pytorch_tanh")
+                             hiddenActivation: "gelu_pytorch_tanh",
+                             variant: .gemma4)
         let layout = PrefillChunkScratchLayout(config: toy, chunkTokens: 4)
 
         let scratch = try PrefillChunkScratchBuffers.allocate(device: ctx.device, layout: layout)

@@ -41,7 +41,12 @@ import Testing
             ).run()
         }
 
-        for _ in 0..<200 where !HangingInstallURLProtocol.started {
+        // Wall clock, not an iteration count: 200 x 5 ms is about a second idle
+        // but far less work than that under a loaded machine, and the budget
+        // has to mean the same thing either way. The assertion below is what
+        // reports expiry.
+        let deadline = ContinuousClock.now + .seconds(30)
+        while !HangingInstallURLProtocol.started, ContinuousClock.now < deadline {
             try await Task.sleep(for: .milliseconds(5))
         }
         #expect(HangingInstallURLProtocol.started)
@@ -113,8 +118,12 @@ import Testing
             }
         }
 
+        // Wall clock for the same reason as the wait above: the loop is racing
+        // an external `lockf` process taking the lock, and how many retries
+        // that takes is a property of the machine, not of the code under test.
         var observedContention = false
-        for _ in 0..<100 {
+        let contentionDeadline = ContinuousClock.now + .seconds(30)
+        while ContinuousClock.now < contentionDeadline {
             do {
                 _ = try InstallLock.acquire(outputDirectory: output)
             } catch {
