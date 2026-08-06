@@ -117,9 +117,24 @@ public enum RangeCopyPlanner {
         guard rangeChunkBytes > 0 else {
             throw RepackError.configurationInvalid(detail: "rangeChunkBytes must be positive")
         }
+        // A TOTAL order, deliberately. `(shardID, sourceOffset)` alone is only a
+        // weak order — two copies that read the SAME source range tie — and
+        // `sorted(by:)` is not documented as stable, so a tie would let the
+        // input order decide where a range boundary falls and therefore reach
+        // `canonicalFingerprint`, which is hashed into every resume checkpoint.
+        // No such tie exists today (every source range in a Gemma snapshot is
+        // read exactly once), so adding the destination tiebreakers cannot move
+        // any current fingerprint; it stops the first aliased source range — a
+        // tied word embedding emitted as a second tensor is the obvious case —
+        // from silently making the plan input-order dependent.
         let sorted = splitLargeCopies(copies, rangeChunkBytes: rangeChunkBytes).sorted {
             if $0.shardID != $1.shardID { return $0.shardID < $1.shardID }
-            return $0.sourceOffset < $1.sourceOffset
+            if $0.sourceOffset != $1.sourceOffset { return $0.sourceOffset < $1.sourceOffset }
+            if $0.size != $1.size { return $0.size < $1.size }
+            if $0.destinationPath != $1.destinationPath {
+                return $0.destinationPath < $1.destinationPath
+            }
+            return $0.destinationOffset < $1.destinationOffset
         }
         var out: [CoalescedRangeCopy] = []
         var currentShard: String?

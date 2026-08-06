@@ -6,13 +6,16 @@ import Foundation
 
     /// Hand-write a tiny layout.json with one layer, two experts, two
     /// sub-tensors each. Returns the directory URL.
-    static func writeToyLayout() throws -> URL {
+    ///
+    /// `overrides` replaces top-level keys, which is how the bounds tests state
+    /// a corrupt `expertsPerLayer` without a second fixture.
+    static func writeToyLayout(_ overrides: [String: Any] = [:]) throws -> URL {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("gturbo-layout-test-\(UUID().uuidString)")
         let exp = dir.appendingPathComponent("packed_experts")
         try FileManager.default.createDirectory(at: exp, withIntermediateDirectories: true)
 
-        let root: [String: Any] = [
+        var root: [String: Any] = [
             "expertStride": 16384,
             "numLayers": 1,
             "expertsPerLayer": 2,
@@ -66,6 +69,7 @@ import Foundation
                 ],
             ],
         ]
+        for (key, value) in overrides { root[key] = value }
         let data = try JSONSerialization.data(withJSONObject: root, options: [.sortedKeys])
         try data.write(to: exp.appendingPathComponent("layout.json"))
         return dir
@@ -103,6 +107,56 @@ import Foundation
         } throws: { error in
             if case ModelError.missingFile = error { return true }
             return false
+        }
+    }
+
+    /// **`expertsPerLayer` is an allocation count read out of a file.**
+    ///
+    /// `[ExpertEntry?](repeating: nil, count: expertsPerLayer)` TRAPS on a
+    /// negative count — the process aborts, taking the app with it, and nothing
+    /// reports which file was corrupt. Same class as the manifest traps already
+    /// fixed (`manifest.numLayers: -1`, `fullAttentionLayerMask: [-1]`), and
+    /// reached the same way: `layout.json` is a file on disk that the loader
+    /// reads before anything has compared it to the manifest.
+    ///
+    /// `maxExpertsPerLayer + 1` is in the table for the other half: it does not
+    /// trap, it allocates, and a 16 MiB layout can ask for an arbitrarily large
+    /// one.
+    @Test(arguments: [-1, PackedExpertsLayoutReader.maxExpertsPerLayer + 1])
+    func outOfRangeExpertsPerLayerIsReportedRatherThanTrapping(_ experts: Int) throws {
+        let dir = try Self.writeToyLayout(["expertsPerLayer": experts])
+        defer { try? FileManager.default.removeItem(at: dir) }
+        #expect {
+            _ = try PackedExpertsLayoutReader.load(directoryURL: dir)
+        } throws: { error in
+            guard case ModelError.indexCorrupt(let detail) = error else { return false }
+            return detail.contains("expertsPerLayer is out of range")
+        }
+    }
+
+    /// Zero is a real answer — a synthetic snapshot with no routed experts
+    /// writes it, and `GTurboJSON.encodeLayout` emits `?? 0` when there are no
+    /// layer plans. Pinned so the bound above is a bound and not an accidental
+    /// `> 0`.
+    @Test func zeroExpertsPerLayerStillLoads() throws {
+        let dir = try Self.writeToyLayout([
+            "expertsPerLayer": 0,
+            "layers": [["layer": 0, "file": "layer_00.bin", "experts": [] as [Any]]],
+        ])
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let layout = try PackedExpertsLayoutReader.load(directoryURL: dir)
+        #expect(layout.expertsPerLayer == 0)
+        #expect(layout.layers.first?.experts.isEmpty == true)
+    }
+
+    @Test func negativeLayerCountIsReported() throws {
+        let dir = try Self.writeToyLayout(["numLayers": -1])
+        defer { try? FileManager.default.removeItem(at: dir) }
+        #expect {
+            _ = try PackedExpertsLayoutReader.load(directoryURL: dir)
+        } throws: { error in
+            guard case ModelError.indexCorrupt(let detail) = error else { return false }
+            return detail.contains("numLayers is negative")
         }
     }
 

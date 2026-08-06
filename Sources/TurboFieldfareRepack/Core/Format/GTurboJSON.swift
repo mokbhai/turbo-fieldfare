@@ -31,7 +31,7 @@ enum GTurboJSON {
                                       expertStride: UInt64,
                                       bitWidths: QuantBitWidths) throws -> Data {
         let arch = plan.arch
-        let archDict: [String: Any] = [
+        var archDict: [String: Any] = [
             "hiddenSize": arch.hiddenSize,
             "ffnIntermediate": arch.intermediateSize,
             "moeIntermediateSize": arch.moeIntermediateSize,
@@ -54,6 +54,32 @@ enum GTurboJSON {
             "hiddenActivation": arch.hiddenActivation,
             "fullAttentionLayerMask": arch.fullAttentionLayerMask.map { Int($0) }
         ]
+        // `family` is emitted only for non-Gemma architectures, so a freshly
+        // repacked Gemma manifest is byte-identical to every one already shipped
+        // and the manifest SHA bound by `VerifiedInstallReceipt` does not move.
+        // The reader defaults a missing `family` to gemma4, which is the same
+        // contract read from the other end.
+        //
+        // `versionMinor` is deliberately NOT bumped: the key is additive and
+        // defaulted, and the minor version is hashed into
+        // `RangeCopyPlanner.canonicalFingerprint`, so a bump would invalidate
+        // every in-flight resume checkpoint for a schema change nothing reads.
+        switch arch.variant {
+        case .gemma4:
+            break
+        case .bailingMoeV2(let extras):
+            archDict["family"] = ArchFamily.bailingMoeV2.rawValue
+            archDict["denseIntermediateSize"] = extras.denseIntermediateSize
+            archDict["firstKDenseReplace"] = extras.firstKDenseReplace
+            archDict["numSharedExperts"] = extras.numSharedExperts
+            archDict["nGroup"] = extras.nGroup
+            archDict["topkGroup"] = extras.topkGroup
+            archDict["routedScalingFactor"] = extras.routedScalingFactor
+            archDict["normTopkProb"] = extras.normTopkProb
+            archDict["scoreFunction"] = extras.scoreFunction
+            archDict["routerEnableExpertBias"] = extras.routerEnableExpertBias
+            archDict["useQKNorm"] = extras.useQKNorm
+        }
         let quantBits = [
             "embedding": bitWidths.embedding,
             "attention": bitWidths.attention,

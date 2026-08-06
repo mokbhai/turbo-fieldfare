@@ -1,4 +1,5 @@
 import Foundation
+@testable import TurboFieldfareRepackCore
 
 /// Synthesises a tiny MLX-affine-quantized safetensors snapshot inside a
 /// temporary directory. The remote repack tests need only deterministic bytes
@@ -274,24 +275,43 @@ enum SyntheticSnapshot {
         let fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0o644)
         precondition(fd >= 0, "open failed for \(path)")
         defer { close(fd) }
+        // `Posix.pwriteAll`, not bare `write(2)` with a discarded return value.
+        // A short or failed write silently truncated the fixture, and the shard
+        // is only read again inside `Safetensors.parseHeaderBytes` — so the
+        // symptom was a thrown `safetensorsTensorOutOfRange` from the middle of
+        // whichever test happened to consume the snapshot, most visibly the
+        // frozen-layout goldens, with nothing pointing at the writer. A fixture
+        // that cannot be written must fail as a fixture error.
+        var fileOffset: UInt64 = 0
         var headerLenLE = UInt64(padded.count).littleEndian
-        withUnsafeBytes(of: &headerLenLE) { raw in
-            _ = write(fd, raw.baseAddress, 8)
+        try withUnsafeBytes(of: &headerLenLE) { raw in
+            try Posix.pwriteAll(fd: fd, path: path,
+                                buf: raw.baseAddress!, count: 8, offset: fileOffset)
         }
-        padded.withUnsafeBytes { raw in
-            _ = write(fd, raw.baseAddress, padded.count)
+        fileOffset += 8
+        try padded.withUnsafeBytes { raw in
+            try Posix.pwriteAll(fd: fd, path: path,
+                                buf: raw.baseAddress!, count: padded.count,
+                                offset: fileOffset)
         }
-        for (_, _, _, bytes) in tensors {
-            bytes.withUnsafeBufferPointer { ptr in
-                _ = write(fd, ptr.baseAddress, ptr.count)
+        fileOffset += UInt64(padded.count)
+        for (_, _, _, bytes) in tensors where !bytes.isEmpty {
+            try bytes.withUnsafeBufferPointer { ptr in
+                try Posix.pwriteAll(fd: fd, path: path,
+                                    buf: ptr.baseAddress!, count: ptr.count,
+                                    offset: fileOffset)
             }
+            fileOffset += UInt64(bytes.count)
         }
     }
 }
 
 /// Tiny deterministic PRNG. We do not need crypto quality — just stable
 /// byte streams across test runs.
-struct SplitMix64 {
+/// Seeded so that a test which shuffles an input reproduces its own failure.
+/// `next()` already has `RandomNumberGenerator`'s signature, so the conformance
+/// is declaration-only and makes `shuffled(using:)` available.
+struct SplitMix64: RandomNumberGenerator {
     private var state: UInt64
     init(seed: UInt64) { self.state = seed }
     mutating func next() -> UInt64 {

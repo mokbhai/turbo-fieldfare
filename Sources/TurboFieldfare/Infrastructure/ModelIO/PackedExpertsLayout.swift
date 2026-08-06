@@ -47,6 +47,13 @@ struct PackedExpertsLayout: Sendable {
 enum PackedExpertsLayoutReader {
     static let defaultMaxBytes: UInt64 = 16 * 1024 * 1024
 
+    /// Ceiling for `expertsPerLayer`, which `load` turns straight into an
+    /// allocation. Far above anything published — the widest supported
+    /// checkpoint has 256 routed experts per layer — and present only so a
+    /// corrupt number cannot be turned into an allocation before anything
+    /// compares it. Same class as the manifest bounds in `ManifestReader`.
+    static let maxExpertsPerLayer = 65_536
+
     static func load(directoryURL: URL,
                             maxBytes: UInt64 = defaultMaxBytes) throws -> PackedExpertsLayout {
         let url = directoryURL
@@ -74,6 +81,25 @@ enum PackedExpertsLayoutReader {
             let layersArr = root["layers"] as? [[String: Any]]
         else {
             throw ModelError.indexCorrupt(detail: "layout.json: missing top-level keys")
+        }
+
+        // `layout.json` arrives from disk, and `expertsPerLayer` is used below
+        // as `[ExpertEntry?](repeating: nil, count: expertsPerLayer)`. That is a
+        // TRAP for a negative value, not a throw: a corrupt layout aborted the
+        // whole process instead of being reported, and an absurd positive one
+        // allocates before anything has compared it to the manifest. Zero is
+        // allowed — a synthetic snapshot with no routed experts writes it.
+        //
+        // `numLayers` is only carried, never allocated from, but a negative one
+        // is corrupt for the same reason and there is no version of this file
+        // where it is meaningful.
+        guard expertsPerLayer >= 0, expertsPerLayer <= maxExpertsPerLayer else {
+            throw ModelError.indexCorrupt(
+                detail: "layout.json: expertsPerLayer is out of range: \(expertsPerLayer)")
+        }
+        guard numLayers >= 0 else {
+            throw ModelError.indexCorrupt(
+                detail: "layout.json: numLayers is negative: \(numLayers)")
         }
 
         var layers: [LayerLayout] = []
