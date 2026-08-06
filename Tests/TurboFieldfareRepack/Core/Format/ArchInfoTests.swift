@@ -220,6 +220,31 @@ struct ArchInfoTests {
         }
     }
 
+    /// An explicit `null` means the same thing as omitting the key.
+    ///
+    /// `JSONSerialization` decodes JSON `null` to `NSNull()`, which is not
+    /// `nil`, so testing absence with `values[k] == nil` would route
+    /// `"key": null` to the strict reader and throw — rejecting configs that
+    /// parse on main, for a spelling upstream uses to mean "unset".
+    ///
+    /// Deliberately the opposite of `manifest.json`'s `family` key, where an
+    /// explicit null IS rejected: that file is written and read by this
+    /// package, so a null there is malformed rather than conventional.
+    @Test func gemmaOptionalKeysTreatAnExplicitNullAsAbsent() throws {
+        let arch = try loadGemma(
+            overriding: ["tie_word_embeddings": NSNull(),
+                         "attention_k_eq_v": NSNull(),
+                         "hidden_activation": NSNull(),
+                         "rope_parameters": NSNull()],
+            tag: "gemma-null-optionals")
+        #expect(arch.tieWordEmbeddings == false)
+        #expect(arch.attentionKEqV == false)
+        #expect(arch.hiddenActivation == "gelu_pytorch_tanh")
+        #expect(arch.partialRotaryFactor == 0.25)
+        #expect(arch.fullRopeTheta == 1_000_000.0)
+        #expect(arch.ropeTheta == 10_000.0)
+    }
+
     /// ...and the same keys, absent, still take their documented defaults. This
     /// is the half that stops the strictness above from turning into "every key
     /// is now mandatory", which would reject configs that parse today.
