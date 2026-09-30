@@ -1,7 +1,7 @@
 # Local OpenAI-compatible server
 
-`TurboFieldfareServer` exposes a local Chat Completions API for one Gemma
-model. It binds to `127.0.0.1` without authentication or TLS. Do not expose it
+`TurboFieldfareServer` exposes a local Chat Completions API, and a text-only
+Anthropic Messages API, for one Gemma model. It binds to `127.0.0.1` without authentication or TLS. Do not expose it
 through a proxy or tunnel.
 
 ## Start the server
@@ -137,6 +137,43 @@ The server accepts only function tools. Omit `tool_choice` or set it to `auto`
 to allow calls. Set it to `none` to disable them. The server does not support
 `required`, named tool selection, or `parallel_tool_calls: false`.
 
+## Anthropic Messages API
+
+`POST /v1/messages` accepts Anthropic Messages requests, so clients built on the
+Anthropic SDK can use the same server. Set the SDK base URL to
+`http://127.0.0.1:8080` (without `/v1`). Any API key works, because the server
+does not check keys.
+
+```bash
+curl --silent --show-error http://127.0.0.1:8080/v1/messages \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "gemma-4-26b-a4b-it",
+    "max_tokens": 16,
+    "system": "Answer in one word.",
+    "messages": [{"role": "user", "content": "Reply with exactly READY."}]
+  }'
+```
+
+`model` must match the served model ID, and `max_tokens` is required. `system`
+and message `content` can be strings or arrays of text blocks. The server
+ignores extra block fields such as `cache_control`. Supported options are
+`temperature`, `top_p`, `top_k`, `stop_sequences`, and `stream`. It reports the
+matched stop sequence in `stop_sequence`.
+
+With `"stream": true`, the response uses Anthropic's event sequence:
+`message_start`, `content_block_start`, `content_block_delta`,
+`content_block_stop`, `message_delta`, and `message_stop`. While a request
+waits in the queue, the server sends `ping` events. A failure after streaming
+starts sends an `error` event and closes the stream.
+
+This endpoint is text only. It rejects tools, images and other non-text blocks,
+extended thinking, and a final assistant message (prefill) with a 400 error.
+For tool calls, use Chat Completions. Errors use Anthropic's
+`{"type": "error", "error": {...}}` envelope. In `usage`, prompt-cache reuse
+appears as `cache_read_input_tokens`, and `input_tokens` counts only the prompt
+tokens that were not reused.
+
 ## Supported API
 
 Endpoints:
@@ -144,6 +181,7 @@ Endpoints:
 - `GET /health`
 - `GET /v1/models`
 - `POST /v1/chat/completions`
+- `POST /v1/messages` (Anthropic Messages, text only)
 
 Chat Completions supports JSON and Server-Sent Events responses. Set
 `"stream": true` for streaming. Set

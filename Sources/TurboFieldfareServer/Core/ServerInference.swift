@@ -12,15 +12,20 @@ public struct ServerCompletion: Equatable, Sendable {
     public let toolCalls: [ParsedToolCall]
     public let finishReason: String
     public let usage: OpenAIUsage
+    /// The client stop string that ended generation, when one did. OpenAI has
+    /// nowhere to report it; Anthropic's `stop_sequence` does.
+    public let stopSequence: String?
 
     public init(content: String,
                 toolCalls: [ParsedToolCall],
                 finishReason: String,
-                usage: OpenAIUsage) {
+                usage: OpenAIUsage,
+                stopSequence: String? = nil) {
         self.content = content
         self.toolCalls = toolCalls
         self.finishReason = finishReason
         self.usage = usage
+        self.stopSequence = stopSequence
     }
 }
 
@@ -349,6 +354,7 @@ public actor ServerModelSession: ServerInferenceBackend {
             usage: OpenAIUsage(promptTokens: result.prefillTokens,
                                completionTokens: result.newTokens,
                                totalTokens: result.prefillTokens + result.newTokens,
-                               cachedTokens: result.cachedPromptTokens))
+                               cachedTokens: result.cachedPromptTokens),
+            stopSequence: stopMatcher.matchedStop)
     }
 }
