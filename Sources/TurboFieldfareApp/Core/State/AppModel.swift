@@ -69,6 +69,15 @@ public final class AppModel {
     public var topK: Int = 64
     public var topPEnabled: Bool = true
     public var topP: Double = 0.95
+    /// 1 leaves logits untouched. Anything above it also forces the logits
+    /// head, exactly as a non-zero temperature does.
+    public var repetitionPenalty: Double = 1.0
+    /// When off, a reply may use whatever context the prompt leaves.
+    public var maxResponseTokensEnabled: Bool = false
+    public var maxResponseTokens: Int = 1_024
+    /// Seeded into each new conversation. Changing it never rewrites an
+    /// existing conversation's own system prompt.
+    public private(set) var defaultSystemPrompt: String = ""
     public var diagnostics: AppDiagnostics?
     /// A failure that blocks every conversation equally — a model load, an
     /// install, or the runtime itself. Set only through `setGlobalError`.
@@ -160,6 +169,10 @@ public final class AppModel {
     /// cleared only when the turn is committed, discarded, or replaced by the
     /// next `run()`.
     private(set) var liveTurnConversationID: UUID?
+    /// The exchange a regenerate took out of its conversation, held until the
+    /// replacement commits. A cancelled or failed regenerate puts it back, so
+    /// asking for a second answer can never cost the first one.
+    private var regenerationBackup: RegenerationBackup?
     private var hasHandledTerminalEvent = false
     private let memorySampler: AppMemorySampler
     private let settingsPersistenceEnabled: Bool
@@ -200,6 +213,10 @@ public final class AppModel {
         self.topK = settings.topK
         self.topPEnabled = settings.topPEnabled
         self.topP = settings.topP
+        self.repetitionPenalty = settings.repetitionPenalty
+        self.maxResponseTokensEnabled = settings.maxResponseTokensEnabled
+        self.maxResponseTokens = settings.maxResponseTokens
+        self.defaultSystemPrompt = settings.defaultSystemPrompt
         self.installationStatus = AppModelInstallationProbe.status(at: directory)
         self.client = client
         self.installer = installer
@@ -460,6 +477,9 @@ public final class AppModel {
 
     private func conversationPlainText(prompt: String, response: String) -> String {
         var sections: [String] = []
+        if let systemPrompt = activeConversation?.effectiveSystemPrompt {
+            sections.append("System:\n\(systemPrompt)")
+        }
         for turn in committedTurns {
             sections.append(turn.role == .user
                 ? "You:\n\(turn.content)"
@@ -500,6 +520,14 @@ public final class AppModel {
         return max(1, Int((Double(text.count) / 3.5).rounded(.up)))
     }
 
+    /// Every turn plus the system prompt, for a conversation with no
+    /// service-reported count to anchor on.
+    private static func estimateUnanchoredTokens(_ conversation: Conversation) -> Int {
+        conversation.turns.reduce(estimateTokens(conversation.effectiveSystemPrompt ?? "")) {
+            $0 + estimateTokens($1.content)
+        }
+    }
+
     /// Anchored on the exact prompt count the service reported for the previous
     /// generation, so only the turns added since then are estimated.
     public var estimatedNextPromptTokens: Int {
@@ -507,9 +535,7 @@ public final class AppModel {
             promptText.trimmingCharacters(in: .whitespacesAndNewlines))
         guard let conversation = activeConversation else { return pending }
         guard let anchor = conversation.lastPromptTokenCount else {
-            return conversation.turns.reduce(0) {
-                $0 + Self.estimateTokens($1.content)
-            } + pending
+            return Self.estimateUnanchoredTokens(conversation) + pending
         }
         let sinceAnchor = conversation.turns
             .last(where: { $0.role == .assistant })
@@ -524,9 +550,7 @@ public final class AppModel {
     public var contextUsedTokens: Int {
         guard let conversation = activeConversation else { return 0 }
         guard let anchor = conversation.lastPromptTokenCount else {
-            return conversation.turns.reduce(0) {
-                $0 + Self.estimateTokens($1.content)
-            }
+            return Self.estimateUnanchoredTokens(conversation)
         }
         let sinceAnchor = conversation.turns
             .last(where: { $0.role == .assistant })
@@ -583,8 +607,16 @@ public final class AppModel {
                             forceLogitsHead: currentForceLogitsHead)
     }
 
+    /// Must agree with `AppGenerationRequest.isPureGreedy`, or a greedy run
+    /// with a repetition penalty would ask for a runtime that was never loaded.
     private var currentForceLogitsHead: Bool {
-        temperature != 0
+        temperature != 0 || effectiveRepetitionPenalty != 1
+    }
+
+    /// Rounded to the slider's step so floating-point residue can never turn
+    /// an intended 1.0 into a penalty that forces the logits head.
+    private var effectiveRepetitionPenalty: Float {
+        Float((repetitionPenalty * 100).rounded() / 100)
     }
 
     public func setModelURL(_ url: URL) {
@@ -1076,6 +1108,10 @@ public final class AppModel {
         topK = settings.topK
         topPEnabled = settings.topPEnabled
         topP = settings.topP
+        repetitionPenalty = settings.repetitionPenalty
+        maxResponseTokensEnabled = settings.maxResponseTokensEnabled
+        maxResponseTokens = settings.maxResponseTokens
+        defaultSystemPrompt = settings.defaultSystemPrompt
     }
 
     private func persistSettings() {
@@ -1088,7 +1124,11 @@ public final class AppModel {
             topK: topK,
             topPEnabled: topPEnabled,
             topP: topP,
-            prefillEnabled: runtimeOptions.prefillEnabled)
+            prefillEnabled: runtimeOptions.prefillEnabled,
+            repetitionPenalty: repetitionPenalty,
+            maxResponseTokensEnabled: maxResponseTokensEnabled,
+            maxResponseTokens: maxResponseTokens,
+            defaultSystemPrompt: defaultSystemPrompt)
         let modelDirectory = URL(fileURLWithPath: modelPathText, isDirectory: true)
         try? MacAppSettingsFileStore.save(
             settings,
@@ -1172,7 +1212,7 @@ public final class AppModel {
             clearActiveConversationError()
             return
         }
-        let conversation = Conversation()
+        let conversation = makeConversation()
         conversations.append(conversation)
         setActiveConversation(conversation.id)
         if discardsLiveTurn { resetLiveTurn() }
@@ -1231,7 +1271,7 @@ public final class AppModel {
             setActiveConversation(conversationsByRecency.first?.id)
         }
         if conversations.isEmpty {
-            let conversation = Conversation()
+            let conversation = makeConversation()
             conversations.append(conversation)
             setActiveConversation(conversation.id)
         }
@@ -1289,6 +1329,163 @@ public final class AppModel {
         isContextOverflowNoticeVisible = false
     }
 
+    // MARK: - System prompt
+
+    /// The system prompt of the conversation on screen, empty when it has none.
+    public var activeSystemPrompt: String {
+        activeConversation?.systemPrompt ?? ""
+    }
+
+    public var hasActiveSystemPrompt: Bool {
+        activeConversation?.effectiveSystemPrompt != nil
+    }
+
+    /// Replaces the system prompt of the conversation on screen.
+    ///
+    /// The service-reported prompt count no longer describes what the next
+    /// request will send, so the context estimate drops back to a full guess
+    /// until the next generation reports an exact figure again.
+    public func setActiveSystemPrompt(_ text: String) {
+        guard let activeConversationID,
+              let index = conversations.firstIndex(where: { $0.id == activeConversationID })
+        else { return }
+        let stored: String? = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? nil : text
+        guard conversations[index].systemPrompt != stored else { return }
+        conversations[index].systemPrompt = stored
+        conversations[index].lastPromptTokenCount = nil
+        persistConversations()
+    }
+
+    /// Sets the system prompt that new conversations start with.
+    public func setDefaultSystemPrompt(_ text: String) {
+        defaultSystemPrompt = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "" : text
+        persistSettings()
+    }
+
+    private func makeConversation() -> Conversation {
+        Conversation(systemPrompt: defaultSystemPrompt.isEmpty ? nil : defaultSystemPrompt)
+    }
+
+    // MARK: - Generation parameters
+
+    /// Puts every sampling control back to the shipped defaults. Memory and
+    /// runtime choices are left alone: changing those costs a model reload.
+    public func resetGenerationParameters() {
+        let defaults = MacAppSettings()
+        temperature = defaults.temperature
+        topKEnabled = defaults.topKEnabled
+        topK = defaults.topK
+        topPEnabled = defaults.topPEnabled
+        topP = defaults.topP
+        repetitionPenalty = defaults.repetitionPenalty
+        maxResponseTokensEnabled = defaults.maxResponseTokensEnabled
+        maxResponseTokens = defaults.maxResponseTokens
+        persistSettings()
+    }
+
+    public func applySamplingPreset(_ preset: AppSamplingPreset) {
+        temperature = preset.temperature
+        topKEnabled = true
+        topK = preset.topK
+        topPEnabled = true
+        topP = preset.topP
+        persistSettings()
+    }
+
+    /// The preset the current sampling settings match, if any.
+    public var activeSamplingPreset: AppSamplingPreset? {
+        AppSamplingPreset.allCases.first {
+            temperature == $0.temperature && topKEnabled && topK == $0.topK
+                && topPEnabled && topP == $0.topP
+        }
+    }
+
+    public var generationParametersAreDefault: Bool {
+        let defaults = MacAppSettings()
+        return temperature == defaults.temperature
+            && topKEnabled == defaults.topKEnabled
+            && topK == defaults.topK
+            && topPEnabled == defaults.topPEnabled
+            && topP == defaults.topP
+            && repetitionPenalty == defaults.repetitionPenalty
+            && maxResponseTokensEnabled == defaults.maxResponseTokensEnabled
+            && maxResponseTokens == defaults.maxResponseTokens
+    }
+
+    // MARK: - Last exchange
+
+    /// Whether the conversation on screen ends in an exchange that can be
+    /// acted on. A live turn on screen — a cancelled or failed run — sits
+    /// after that exchange, so it is no longer the last thing in the chat.
+    private var hasActionableLastExchange: Bool {
+        activeConversation?.lastExchange != nil
+            && !isRunning
+            && liveTurnConversationID != activeConversationID
+    }
+
+    public var canRegenerateLastResponse: Bool {
+        hasActionableLastExchange && isModelAvailable && !loadState.isLoading
+            && !hasStaleLoadedRuntime
+    }
+
+    /// Editing moves the prompt into the composer, so it would overwrite a
+    /// draft the user is in the middle of.
+    public var canEditLastPrompt: Bool {
+        hasActionableLastExchange
+            && promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// Asks for a new answer to the last prompt. The previous answer is only
+    /// replaced once the new one commits; see `regenerationBackup`.
+    ///
+    /// Sent through `run()` like any other prompt, so every refusal and every
+    /// terminal path stays in one place. Whatever the user had typed in the
+    /// composer is held aside and put back, whether or not the run starts.
+    public func regenerateLastResponse() {
+        guard canRegenerateLastResponse,
+              let id = activeConversationID,
+              let index = conversations.firstIndex(where: { $0.id == id }),
+              let exchange = conversations[index].lastExchange else { return }
+        let backup = RegenerationBackup(
+            conversationID: id,
+            turns: conversations[index].turns,
+            lastPromptTokenCount: conversations[index].lastPromptTokenCount)
+        let savedDraft = drafts[id]
+        conversations[index].turns.removeLast(2)
+        conversations[index].lastPromptTokenCount = nil
+        drafts[id] = exchange.user.content
+        run()
+        if isRunning && liveTurnConversationID == id {
+            regenerationBackup = backup
+        } else if let index = conversations.firstIndex(where: { $0.id == id }) {
+            conversations[index].turns = backup.turns
+            conversations[index].lastPromptTokenCount = backup.lastPromptTokenCount
+        }
+        drafts[id] = savedDraft
+    }
+
+    /// Takes the last exchange out of the conversation and puts its prompt back
+    /// in the composer, so it can be revised and sent again.
+    public func editLastPrompt() {
+        guard canEditLastPrompt,
+              let id = activeConversationID,
+              let index = conversations.firstIndex(where: { $0.id == id }),
+              let exchange = conversations[index].lastExchange else { return }
+        conversations[index].turns.removeLast(2)
+        conversations[index].lastPromptTokenCount = nil
+        conversations[index].updatedAt = Date()
+        drafts[id] = exchange.user.content
+        persistConversations()
+    }
+
+    /// The conversation on screen as Markdown, committed turns only.
+    public var activeConversationMarkdown: String? {
+        guard let conversation = activeConversation, !conversation.isEmpty else { return nil }
+        return conversation.markdownTranscript
+    }
+
     // MARK: - Errors
 
     /// Records a failure that blocks every conversation: a model load, an
@@ -1331,7 +1528,7 @@ public final class AppModel {
             : ConversationStoreFile()
         conversations = store.conversations
         if conversations.isEmpty {
-            conversations = [Conversation()]
+            conversations = [makeConversation()]
         }
         // A reload replaces the whole set, and a model switch reads a different
         // store, so drafts keyed by conversations that are no longer here would
@@ -1362,6 +1559,7 @@ public final class AppModel {
             // The owning conversation was deleted mid-run. Nothing can be
             // committed, and leaving the text in place would let it be appended
             // to whichever conversation commits next.
+            regenerationBackup = nil
             clearLiveTurn()
             return
         }
@@ -1375,10 +1573,13 @@ public final class AppModel {
         // the prompt goes back to its own conversation's draft, armed for a
         // retry where the user typed it.
         guard !response.isEmpty else {
-            restoreSubmittedPromptIfComposerIsEmpty()
-            clearLiveTurn()
+            if !restoreRegenerationBackup() {
+                restoreSubmittedPromptIfComposerIsEmpty()
+                clearLiveTurn()
+            }
             return
         }
+        regenerationBackup = nil
         let now = Date()
         if !outputPromptText.isEmpty {
             conversations[index].turns.append(
@@ -1475,16 +1676,21 @@ public final class AppModel {
     }
 
     public func makeRequest() throws -> AppGenerationRequest {
+        let system = activeConversation?.effectiveSystemPrompt.map {
+            [DecodeChatMessage(role: .system, content: $0)]
+        } ?? []
         let request = AppGenerationRequest(
             modelDirectory: URL(fileURLWithPath: modelPathText),
-            messages: committedTurns.map(\.decodeMessage)
+            messages: system
+                + committedTurns.map(\.decodeMessage)
                 + [DecodeChatMessage(role: .user, content: promptText)],
-            maxNewTokens: maxNewTokensOverride ?? maxContextTokens,
+            maxNewTokens: maxNewTokensOverride
+                ?? (maxResponseTokensEnabled ? maxResponseTokens : maxContextTokens),
             maxContextTokens: maxContextTokens,
             temperature: Float(temperature),
             topK: topKEnabled ? topK : nil,
             topP: topKEnabled && topPEnabled ? Float(topP) : nil,
-            repetitionPenalty: 1.0,
+            repetitionPenalty: effectiveRepetitionPenalty,
             runtimeOptions: runtimeOptions)
         try request.validate(requireModelDirectory: true)
         return request
@@ -1574,11 +1780,29 @@ public final class AppModel {
     /// place would let the next commit inherit it, so the turn simply goes.
     private func settleUncommittedLiveTurn(_ appError: AppInferenceError) {
         guard !isLiveTurnOwnerMissing else {
+            regenerationBackup = nil
             clearLiveTurn()
             return
         }
         setRunError(appError, for: runOwnerConversationID)
+        if restoreRegenerationBackup() { return }
         restoreSubmittedPromptIfComposerIsEmpty()
+    }
+
+    /// Puts back the exchange a regenerate removed, when the run that was to
+    /// replace it committed nothing. The live turn goes too: it repeats the
+    /// restored prompt, and the answer it holds is the incomplete one the user
+    /// is being spared. Returns whether there was anything to restore.
+    private func restoreRegenerationBackup() -> Bool {
+        guard let backup = regenerationBackup else { return false }
+        regenerationBackup = nil
+        guard backup.conversationID == liveTurnConversationID,
+              let index = conversations.firstIndex(where: { $0.id == backup.conversationID })
+        else { return false }
+        conversations[index].turns = backup.turns
+        conversations[index].lastPromptTokenCount = backup.lastPromptTokenCount
+        clearLiveTurn()
+        return true
     }
 
     /// Puts the submitted prompt back in the composer after a terminal path that
@@ -1659,4 +1883,10 @@ public final class AppModel {
         guard generation == unloadGeneration else { return }
         unloadTask = nil
     }
+}
+
+private struct RegenerationBackup {
+    let conversationID: UUID
+    let turns: [ChatTurn]
+    let lastPromptTokenCount: Int?
 }

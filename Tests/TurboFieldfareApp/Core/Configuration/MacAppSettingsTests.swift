@@ -55,6 +55,37 @@ import Testing
         #expect(settings == MacAppSettings())
     }
 
+    /// A file written before the newer keys existed must keep the choices it
+    /// holds, not be discarded as corrupt.
+    @Test func fileWithoutNewerKeysKeepsItsValues() throws {
+        let legacy = """
+        {"contextTokens":8192,"expertCacheSlots":24,"prefillEnabled":false,
+         "temperature":0.7,"topK":40,"topKEnabled":true,"topP":0.9,
+         "topPEnabled":true,"version":1}
+        """
+        let settings = try JSONDecoder().decode(MacAppSettings.self, from: Data(legacy.utf8))
+        #expect(settings.isValid())
+        #expect(settings.contextTokens == 8_192)
+        #expect(settings.temperature == 0.7)
+        #expect(settings.repetitionPenalty == 1)
+        #expect(!settings.maxResponseTokensEnabled)
+        #expect(settings.defaultSystemPrompt.isEmpty)
+    }
+
+    @Test func newerKeysRoundTrip() throws {
+        let settings = MacAppSettings(
+            repetitionPenalty: 1.1,
+            maxResponseTokensEnabled: true,
+            maxResponseTokens: 2_048,
+            defaultSystemPrompt: "Be brief.")
+        let decoded = try JSONDecoder().decode(
+            MacAppSettings.self,
+            from: JSONEncoder().encode(settings))
+        #expect(decoded == settings)
+        #expect(!MacAppSettings(repetitionPenalty: 3).isValid())
+        #expect(!MacAppSettings(maxResponseTokens: 0).isValid())
+    }
+
     @MainActor
     @Test func appModelLoadsAndSavesPersistedSettings() throws {
         let root = try makeTemporaryRoot()

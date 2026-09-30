@@ -113,6 +113,36 @@ import TurboFieldfareDecodeProtocol
         #expect(decoded.textDelta == "caf\u{00E9}")
     }
 
+    /// The app's Top-K and Top-P used to stop at the IPC boundary, so the
+    /// service always sampled with its own defaults.
+    @Test func generationRequestCarriesTruncationSettings() throws {
+        let request = DecodeGenerationRequest(
+            messages: [.init(role: .system, content: "Be brief."),
+                       .init(role: .user, content: "hi")],
+            maxNewTokens: 8,
+            maxContextTokens: 4_096,
+            temperature: 0.7,
+            topK: 12,
+            topP: 0.8,
+            repetitionPenalty: 1.1)
+        let decoded = try JSONDecoder().decode(
+            DecodeGenerationRequest.self,
+            from: JSONEncoder().encode(request))
+        #expect(decoded.topK == 12)
+        #expect(decoded.topP == 0.8)
+        #expect(decoded.repetitionPenalty == 1.1)
+        #expect(decoded.messages.first?.role == .system)
+
+        let disabled = DecodeGenerationRequest(
+            messages: [.init(role: .user, content: "hi")],
+            maxNewTokens: 8, maxContextTokens: 4_096, temperature: 0.7)
+        let decodedDisabled = try JSONDecoder().decode(
+            DecodeGenerationRequest.self,
+            from: JSONEncoder().encode(disabled))
+        #expect(decodedDisabled.topK == nil)
+        #expect(decodedDisabled.topP == nil)
+    }
+
     @Test func oversizedPayloadIsRejectedBeforeEncoding() {
         let request = DecodeGenerationRequest(
             messages: [.init(

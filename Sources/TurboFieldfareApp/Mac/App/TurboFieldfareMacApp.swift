@@ -56,6 +56,27 @@ struct TurboFieldfareMacApp: App {
                 }
                 .keyboardShortcut("s", modifiers: [.command, .option])
             }
+            CommandMenu("Conversation") {
+                Button("Edit System Prompt…") {
+                    NotificationCenter.default.post(
+                        name: .turboFieldfareEditSystemPrompt, object: nil)
+                }
+                .keyboardShortcut("p", modifiers: [.command, .shift])
+                .disabled(model.requiresModelInstallation)
+                Divider()
+                Button("Regenerate Response", action: model.regenerateLastResponse)
+                    .keyboardShortcut("r", modifiers: .command)
+                    .disabled(!model.canRegenerateLastResponse)
+                Button("Edit Last Prompt", action: model.editLastPrompt)
+                    .keyboardShortcut("e", modifiers: [.command, .shift])
+                    .disabled(!model.canEditLastPrompt)
+                Divider()
+                Button("Export as Markdown…") {
+                    ConversationExport.exportActiveConversation(of: model)
+                }
+                .keyboardShortcut("s", modifiers: [.command, .shift])
+                .disabled(model.activeConversationMarkdown == nil)
+            }
             CommandMenu("Generation") {
                 Button("Cancel Generation") { model.cancel() }
                     .keyboardShortcut(".", modifiers: .command)
