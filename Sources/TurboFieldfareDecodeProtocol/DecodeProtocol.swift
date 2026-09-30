@@ -43,8 +43,8 @@ public struct DecodeLoadRequest: Codable, Sendable {
 }
 
 /// Text-only chat message carried over the decode-service IPC. Role raw values
-/// mirror `GFTokenizer.Role`; the app path never sends tools, developer, or
-/// system messages.
+/// mirror `GFTokenizer.Role`; the app path sends system, user, and assistant
+/// messages, never tools or developer messages.
 public struct DecodeChatMessage: Codable, Sendable, Equatable {
     public enum Role: String, Codable, Sendable {
         case system, developer, user, assistant, tool
@@ -64,18 +64,25 @@ public struct DecodeGenerationRequest: Codable, Sendable {
     public var maxNewTokens: Int
     public var maxContextTokens: Int
     public var temperature: Float
+    /// Nil disables the truncation. Optional so a frame without the key still
+    /// decodes, and because nil is itself a meaningful setting.
+    public var topK: Int?
+    public var topP: Float?
     public var repetitionPenalty: Float
     public var runtimeOptions: DecodeRuntimeOptions
     public var generationID: UUID
 
     public init(messages: [DecodeChatMessage], maxNewTokens: Int, maxContextTokens: Int,
-                temperature: Float, repetitionPenalty: Float = 1,
+                temperature: Float, topK: Int? = nil, topP: Float? = nil,
+                repetitionPenalty: Float = 1,
                 runtimeOptions: DecodeRuntimeOptions = DecodeRuntimeOptions(),
                 generationID: UUID = UUID()) {
         self.messages = messages
         self.maxNewTokens = maxNewTokens
         self.maxContextTokens = maxContextTokens
         self.temperature = temperature
+        self.topK = topK
+        self.topP = topP
         self.repetitionPenalty = repetitionPenalty
         self.runtimeOptions = runtimeOptions
         self.generationID = generationID

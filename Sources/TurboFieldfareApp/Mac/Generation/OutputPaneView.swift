@@ -27,7 +27,7 @@ struct OutputPaneView: View {
             Button("Copy response") {
                 copyResponse()
             }
-            .disabled(model.viewedResponsePlainText.isEmpty)
+            .disabled(lastResponseText.isEmpty)
 
             Button("Copy prompt") {
                 copy(model.viewedOutputPromptText)
@@ -38,6 +38,22 @@ struct OutputPaneView: View {
                 copy(model.viewedConversationPlainText)
             }
             .disabled(model.viewedConversationPlainText.isEmpty)
+
+            Button("Export as Markdown…") {
+                ConversationExport.exportActiveConversation(of: model)
+            }
+            .disabled(model.activeConversationMarkdown == nil)
+
+            Divider()
+
+            Button("Regenerate response", action: model.regenerateLastResponse)
+                .disabled(!model.canRegenerateLastResponse)
+            Button("Edit last prompt", action: model.editLastPrompt)
+                .disabled(!model.canEditLastPrompt)
+            Button("System prompt…") {
+                NotificationCenter.default.post(
+                    name: .turboFieldfareEditSystemPrompt, object: nil)
+            }
 
             Divider()
 
@@ -77,14 +93,59 @@ struct OutputPaneView: View {
                 && model.viewedResponsePlainText.isEmpty)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .overlay(alignment: .topTrailing) {
-                if !model.isRunningInActiveConversation
-                    && !model.viewedResponsePlainText.isEmpty {
-                    copyResponseButton
+                if !model.isRunningInActiveConversation && !lastResponseText.isEmpty {
+                    transcriptActions
                         .padding(8)
                 }
             }
             .padding(.horizontal, 24)
             .padding(.vertical, 20)
+    }
+
+    /// The answer the copy action targets: the live turn when one is on screen
+    /// (a cancelled or failed run), otherwise the last committed answer.
+    private var lastResponseText: String {
+        let live = model.viewedResponsePlainText
+        guard live.isEmpty else { return live }
+        return model.committedTurns.last(where: { $0.role == .assistant })?.content ?? ""
+    }
+
+    private var transcriptActions: some View {
+        HStack(spacing: 6) {
+            if model.canEditLastPrompt {
+                actionButton("Edit last prompt", systemImage: "pencil",
+                             action: model.editLastPrompt)
+            }
+            if model.canRegenerateLastResponse {
+                actionButton("Regenerate response", systemImage: "arrow.clockwise",
+                             action: model.regenerateLastResponse)
+            }
+            if model.activeConversationMarkdown != nil {
+                actionButton("Export as Markdown", systemImage: "square.and.arrow.up") {
+                    ConversationExport.exportActiveConversation(of: model)
+                }
+            }
+            copyResponseButton
+        }
+    }
+
+    private func actionButton(_ title: String,
+                              systemImage: String,
+                              action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.callout.weight(.medium))
+                .foregroundStyle(Color.secondary)
+                .frame(width: 28, height: 28)
+                .contentShape(Circle())
+                .background(.regularMaterial, in: Circle())
+                .overlay {
+                    Circle().stroke(.separator.opacity(0.5), lineWidth: 0.5)
+                }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(title)
+        .help(title)
     }
 
     private var copyResponseButton: some View {
@@ -185,7 +246,7 @@ struct OutputPaneView: View {
     }
 
     private func copyResponse() {
-        copy(model.viewedResponsePlainText)
+        copy(lastResponseText)
         withAnimation(.easeIn(duration: 0.15)) {
             responseCopyFeedbackID = UUID()
         }

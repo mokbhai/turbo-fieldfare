@@ -12,6 +12,7 @@ struct InspectorView: View {
             }
             modelSection
             memorySection
+            systemPromptSection
             generationSection
             runtimeSection
             RunnerDiagnosticsSection(diagnostics: model.diagnostics)
@@ -115,8 +116,66 @@ struct InspectorView: View {
         .disabled(model.isRunning || model.loadState.isLoading)
     }
 
+    private var systemPromptSection: some View {
+        Section("System Prompt") {
+            if model.hasActiveSystemPrompt {
+                Text(model.activeSystemPrompt)
+                    .font(.callout)
+                    .lineLimit(4)
+                    .truncationMode(.tail)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            } else {
+                Text("None for this chat.")
+                    .font(.callout)
+                    .foregroundStyle(.tertiary)
+            }
+            HStack {
+                Button(model.hasActiveSystemPrompt ? "Edit…" : "Add…") {
+                    NotificationCenter.default.post(
+                        name: .turboFieldfareEditSystemPrompt, object: nil)
+                }
+                Spacer()
+                if model.hasActiveSystemPrompt {
+                    Button("Remove") { model.setActiveSystemPrompt("") }
+                }
+            }
+            if !model.defaultSystemPrompt.isEmpty {
+                LabeledContent("New chats") {
+                    Button("Stop using default") { model.setDefaultSystemPrompt("") }
+                        .buttonStyle(.link)
+                        .font(.caption)
+                }
+                .help(model.defaultSystemPrompt)
+            }
+        }
+    }
+
+    private var presetBinding: Binding<AppSamplingPreset?> {
+        Binding(
+            get: { model.activeSamplingPreset },
+            set: { preset in
+                if let preset { model.applySamplingPreset(preset) }
+            })
+    }
+
     private var generationSection: some View {
-        Section("Generation") {
+        Section {
+            LabeledContent("Preset") {
+                Picker("Preset", selection: presetBinding) {
+                    ForEach(AppSamplingPreset.allCases) { preset in
+                        Text(preset.label)
+                            .help(preset.detail)
+                            .tag(Optional(preset))
+                    }
+                    if model.activeSamplingPreset == nil {
+                        Text("Custom").tag(AppSamplingPreset?.none)
+                    }
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+                .fixedSize()
+            }
             LabeledContent("Temperature") {
                 HStack(spacing: 8) {
                     Slider(value: $model.temperature, in: 0...2, step: 0.05)
@@ -151,8 +210,53 @@ struct InspectorView: View {
                     }
                 }
             }
+            LabeledContent("Repetition penalty") {
+                HStack(spacing: 8) {
+                    Slider(value: $model.repetitionPenalty, in: 1...2, step: 0.05)
+                    Text(model.repetitionPenalty, format: .number.precision(.fractionLength(2)))
+                        .monospacedDigit()
+                        .frame(width: 36, alignment: .trailing)
+                }
+            }
+            Text("Above 1.00 discourages repeating earlier tokens. Keep it low: large values distort wording and code.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Toggle("Limit response length", isOn: $model.maxResponseTokensEnabled)
+                .toggleStyle(.switch)
+            if model.maxResponseTokensEnabled {
+                LabeledContent("Max tokens") {
+                    HStack(spacing: 6) {
+                        TextField("Max tokens", value: maxResponseTokensBinding,
+                                  format: .number.grouping(.never))
+                            .multilineTextAlignment(.trailing)
+                            .monospacedDigit()
+                            .frame(width: 64)
+                            .labelsHidden()
+                        Stepper("Max tokens", value: maxResponseTokensBinding,
+                                in: 16...model.maxContextTokens, step: 256)
+                            .labelsHidden()
+                    }
+                }
+            }
+            if model.hasStaleLoadedRuntime {
+                Text("Switching between greedy and sampled decoding, or turning the repetition penalty on or off, requires a model reload.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Button("Reset to Defaults", action: model.resetGenerationParameters)
+                .disabled(model.generationParametersAreDefault)
+        } header: {
+            Text("Generation")
         }
         .disabled(model.isRunning || model.loadState.isLoading)
+    }
+
+    /// Clamped so neither the field nor the stepper can store a length the
+    /// settings file would reject, or one larger than the context itself.
+    private var maxResponseTokensBinding: Binding<Int> {
+        Binding(
+            get: { model.maxResponseTokens },
+            set: { model.maxResponseTokens = min(max($0, 16), model.maxContextTokens) })
     }
 
     private var runtimeSection: some View {

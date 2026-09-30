@@ -49,6 +49,9 @@ public struct Conversation: Codable, Equatable, Sendable, Identifiable {
     /// conversation. Anchors the context estimate so only the turns added since
     /// then have to be guessed at.
     public var lastPromptTokenCount: Int?
+    /// Sent as a system message ahead of every turn. Optional so stores written
+    /// before system prompts existed still decode; nil and empty both mean none.
+    public var systemPrompt: String?
 
     public init(id: UUID = UUID(),
                 title: String = Conversation.untitled,
@@ -56,7 +59,8 @@ public struct Conversation: Codable, Equatable, Sendable, Identifiable {
                 createdAt: Date = Date(),
                 updatedAt: Date = Date(),
                 turns: [ChatTurn] = [],
-                lastPromptTokenCount: Int? = nil) {
+                lastPromptTokenCount: Int? = nil,
+                systemPrompt: String? = nil) {
         self.id = id
         self.title = title
         self.titleIsCustom = titleIsCustom
@@ -64,6 +68,39 @@ public struct Conversation: Codable, Equatable, Sendable, Identifiable {
         self.updatedAt = updatedAt
         self.turns = turns
         self.lastPromptTokenCount = lastPromptTokenCount
+        self.systemPrompt = systemPrompt
+    }
+
+    /// The system prompt as it is sent: trimmed, and nil when there is nothing
+    /// left to send.
+    public var effectiveSystemPrompt: String? {
+        guard let trimmed = systemPrompt?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty else { return nil }
+        return trimmed
+    }
+
+    /// The last exchange, when the conversation ends on a user turn answered by
+    /// an assistant turn. What regenerate and edit act on.
+    public var lastExchange: (user: ChatTurn, assistant: ChatTurn)? {
+        guard turns.count >= 2 else { return nil }
+        let user = turns[turns.count - 2]
+        let assistant = turns[turns.count - 1]
+        guard user.role == .user, assistant.role == .assistant else { return nil }
+        return (user, assistant)
+    }
+
+    /// Markdown rendering of the whole conversation, for export.
+    public var markdownTranscript: String {
+        var sections = ["# \(title)"]
+        if let systemPrompt = effectiveSystemPrompt {
+            sections.append("## System\n\n\(systemPrompt)")
+        }
+        for turn in turns {
+            sections.append(turn.role == .user
+                ? "## You\n\n\(turn.content)"
+                : "## Answer\n\n\(turn.content)")
+        }
+        return sections.joined(separator: "\n\n") + "\n"
     }
 
     public static let untitled = "New Chat"

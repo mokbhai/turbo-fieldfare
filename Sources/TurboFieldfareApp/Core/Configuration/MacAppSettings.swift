@@ -13,6 +13,14 @@ struct MacAppSettings: Codable, Equatable, Sendable {
     var topPEnabled: Bool = true
     var topP: Double = 0.95
     var prefillEnabled: Bool = true
+    var repetitionPenalty: Double = 1.0
+    var maxResponseTokensEnabled: Bool = false
+    var maxResponseTokens: Int = 1_024
+    /// Seeded into each new conversation. Existing conversations keep their own.
+    var defaultSystemPrompt: String = ""
+
+    static let repetitionPenaltyRange: ClosedRange<Double> = 1...2
+    static let maxResponseTokensRange: ClosedRange<Int> = 16...262_144
 
     func isValid() -> Bool {
         version == Self.currentVersion
@@ -21,6 +29,42 @@ struct MacAppSettings: Codable, Equatable, Sendable {
             && temperature.isFinite && (0...2).contains(temperature)
             && (1...256).contains(topK)
             && topP.isFinite && (0.01...1).contains(topP)
+            && repetitionPenalty.isFinite
+            && Self.repetitionPenaltyRange.contains(repetitionPenalty)
+            && Self.maxResponseTokensRange.contains(maxResponseTokens)
+    }
+}
+
+extension MacAppSettings {
+    private enum CodingKeys: String, CodingKey {
+        case version, contextTokens, expertCacheSlots, temperature, topKEnabled,
+             topK, topPEnabled, topP, prefillEnabled, repetitionPenalty,
+             maxResponseTokensEnabled, maxResponseTokens, defaultSystemPrompt
+    }
+
+    /// Keys added after version 1 shipped decode as their defaults, so a file
+    /// written by an older build keeps the choices it holds instead of being
+    /// treated as corrupt and replaced.
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let defaults = MacAppSettings()
+        version = try container.decode(Int.self, forKey: .version)
+        contextTokens = try container.decode(Int.self, forKey: .contextTokens)
+        expertCacheSlots = try container.decode(Int.self, forKey: .expertCacheSlots)
+        temperature = try container.decode(Double.self, forKey: .temperature)
+        topKEnabled = try container.decode(Bool.self, forKey: .topKEnabled)
+        topK = try container.decode(Int.self, forKey: .topK)
+        topPEnabled = try container.decode(Bool.self, forKey: .topPEnabled)
+        topP = try container.decode(Double.self, forKey: .topP)
+        prefillEnabled = try container.decode(Bool.self, forKey: .prefillEnabled)
+        repetitionPenalty = try container.decodeIfPresent(
+            Double.self, forKey: .repetitionPenalty) ?? defaults.repetitionPenalty
+        maxResponseTokensEnabled = try container.decodeIfPresent(
+            Bool.self, forKey: .maxResponseTokensEnabled) ?? defaults.maxResponseTokensEnabled
+        maxResponseTokens = try container.decodeIfPresent(
+            Int.self, forKey: .maxResponseTokens) ?? defaults.maxResponseTokens
+        defaultSystemPrompt = try container.decodeIfPresent(
+            String.self, forKey: .defaultSystemPrompt) ?? defaults.defaultSystemPrompt
     }
 }
 

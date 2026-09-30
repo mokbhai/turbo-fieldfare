@@ -1,4 +1,5 @@
 import TurboFieldfareAppCore
+import TurboFieldfareMacPresentation
 import SwiftUI
 
 struct PromptComposerView: View {
@@ -8,6 +9,9 @@ struct PromptComposerView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
+            if model.hasActiveSystemPrompt {
+                systemPromptChip
+            }
             editor
             footer
         }
@@ -46,9 +50,57 @@ struct PromptComposerView: View {
         model.promptText.isEmpty ? 46 : 84
     }
 
+    /// Shows that this chat carries instructions the transcript does not, so a
+    /// reply shaped by them is never a mystery.
+    private var systemPromptChip: some View {
+        Button(action: editSystemPrompt) {
+            HStack(spacing: 6) {
+                Image(systemName: "text.quote")
+                    .foregroundStyle(TurboFieldfareMacTheme.accentColor)
+                Text(firstLine(of: model.activeSystemPrompt))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .foregroundStyle(.secondary)
+            }
+            .font(.caption)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(TurboFieldfareMacTheme.accentColor.opacity(0.1), in: Capsule())
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .help("System prompt: \(model.activeSystemPrompt)")
+        .accessibilityLabel("Edit system prompt")
+    }
+
+    private func firstLine(of text: String) -> String {
+        text.trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(whereSeparator: \.isNewline)
+            .first.map(String.init) ?? ""
+    }
+
+    private func editSystemPrompt() {
+        NotificationCenter.default.post(name: .turboFieldfareEditSystemPrompt, object: nil)
+    }
+
+    private var systemPromptButton: some View {
+        Button(action: editSystemPrompt) {
+            Label("System prompt", systemImage: model.hasActiveSystemPrompt
+                  ? "text.bubble.fill" : "text.bubble")
+                .labelStyle(.iconOnly)
+                .frame(width: 28, height: 28)
+                .contentShape(Circle())
+        }
+        .buttonStyle(.borderless)
+        .foregroundStyle(model.hasActiveSystemPrompt
+                         ? TurboFieldfareMacTheme.accentColor : .secondary)
+        .help(model.hasActiveSystemPrompt ? "Edit system prompt" : "Add a system prompt")
+    }
+
     private var footer: some View {
         HStack(spacing: 10) {
             promptTips
+            systemPromptButton
             Spacer()
             clearAction
             GenerateControl(model: model)

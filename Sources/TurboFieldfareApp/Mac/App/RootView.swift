@@ -6,6 +6,7 @@ struct RootView: View {
     let model: AppModel
     @State private var conversationChromeHeight: CGFloat = 0
     @AppStorage("sidebarVisible") private var isSidebarVisible = true
+    @State private var isEditingSystemPrompt = false
 
     var body: some View {
         HStack(spacing: 0) {
@@ -44,6 +45,14 @@ struct RootView: View {
         .onReceive(NotificationCenter.default.publisher(
             for: .turboFieldfareToggleSidebar)) { _ in
             isSidebarVisible.toggle()
+        }
+        .onReceive(NotificationCenter.default.publisher(
+            for: .turboFieldfareEditSystemPrompt)) { _ in
+            guard !model.requiresModelInstallation else { return }
+            isEditingSystemPrompt = true
+        }
+        .sheet(isPresented: $isEditingSystemPrompt) {
+            SystemPromptEditorView(model: model)
         }
         .animation(.smooth(duration: 0.3), value: model.requiresModelInstallation)
         .animation(.smooth(duration: 0.25), value: model.error)
