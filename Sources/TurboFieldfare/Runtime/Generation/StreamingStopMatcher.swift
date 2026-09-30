@@ -4,6 +4,9 @@ public struct StreamingStopMatcher: Sendable {
     private let stops: [String]
     private var pending = ""
     public private(set) var isStopped = false
+    /// The stop string that ended the stream, when one did. Earliest match
+    /// wins; among matches at the same position, the first listed.
+    public private(set) var matchedStop: String?
 
     public init(stops: [String]) {
         self.stops = stops.filter { !$0.isEmpty }
@@ -13,9 +16,10 @@ public struct StreamingStopMatcher: Sendable {
         guard !isStopped else { return "" }
         pending += text
         if let match = earliestMatch(in: pending) {
-            let output = String(pending[..<match])
+            let output = String(pending[..<match.index])
             pending = ""
             isStopped = true
+            matchedStop = match.stop
             return output
         }
         let retained = longestPossibleSuffix(in: pending)
@@ -31,8 +35,13 @@ public struct StreamingStopMatcher: Sendable {
         return pending
     }
 
-    private func earliestMatch(in text: String) -> String.Index? {
-        stops.compactMap { text.range(of: $0)?.lowerBound }.min()
+    private func earliestMatch(in text: String) -> (index: String.Index, stop: String)? {
+        var best: (index: String.Index, stop: String)?
+        for stop in stops {
+            guard let index = text.range(of: stop)?.lowerBound else { continue }
+            if best == nil || index < best!.index { best = (index, stop) }
+        }
+        return best
     }
 
     private func longestPossibleSuffix(in text: String) -> Int {

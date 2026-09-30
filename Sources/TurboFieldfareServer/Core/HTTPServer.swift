@@ -151,9 +151,15 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
             guard let head else { return }
             self.head = nil
             if oversized {
-                writeError(context, status: .payloadTooLarge,
-                           OpenAIErrorEnvelope(message: "request body is too large",
-                                               code: "request_too_large"))
+                if head.uri == "/v1/messages" {
+                    writeCodable(context, status: .payloadTooLarge,
+                                 AnthropicErrorEnvelope(type: "request_too_large",
+                                                        message: "request body is too large"))
+                } else {
+                    writeError(context, status: .payloadTooLarge,
+                               OpenAIErrorEnvelope(message: "request body is too large",
+                                                   code: "request_too_large"))
+                }
                 return
             }
             route(head: head, body: body, context: context)
@@ -190,6 +196,19 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
                 return
             }
             handleCompletion(body: body, context: context)
+        case (.POST, "/v1/messages"):
+            guard head.headers.first(name: "content-type")?
+                .lowercased().hasPrefix("application/json") == true else {
+                writeCodable(context, status: .unsupportedMediaType,
+                             AnthropicErrorEnvelope(type: "invalid_request_error",
+                                                    message: "content-type must be application/json"))
+                return
+            }
+            handleMessages(body: body, context: context)
+        case (_, "/v1/messages"):
+            writeCodable(context, status: .methodNotAllowed,
+                         AnthropicErrorEnvelope(type: "invalid_request_error",
+                                                message: "method not allowed"))
         case (_, "/health"), (_, "/v1/models"), (_, "/v1/chat/completions"):
             writeError(context, status: .methodNotAllowed,
                        OpenAIErrorEnvelope(message: "method not allowed",
@@ -274,6 +293,158 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
             writeError(context, status: .badRequest,
                        OpenAIErrorEnvelope(message: "malformed JSON request",
                                            code: "invalid_json"))
+        }
+    }
+
+    /// Anthropic Messages. Shares the queue, backend, heartbeat, and
+    /// disconnect cancellation with chat completions; only the wire format
+    /// differs.
+    private func handleMessages(body: ByteBuffer,
+                                context: ChannelHandlerContext) {
+        do {
+            let bytes = body.getBytes(at: body.readerIndex, length: body.readableBytes) ?? []
+            let decoded = try JSONDecoder().decode(AnthropicMessagesRequest.self, from: Data(bytes))
+            let request = try AnthropicRequestValidator.validate(decoded, modelID: modelID)
+            let messageID = AnthropicResponse.messageID()
+            let contextBox = SendableContext(context)
+            let streamState = StreamState()
+            let startStream: @Sendable () -> Void = {
+                guard request.stream,
+                      streamState.start(eventLoop: contextBox.value.eventLoop,
+                                        interval: self.heartbeatInterval,
+                                        ping: {
+                          self.writeSSEEvent(contextBox.value, name: "ping",
+                                             object: ["type": "ping"])
+                      }) else { return }
+                self.beginStream(contextBox.value)
+                self.writeSSEEvent(contextBox.value, name: "message_start", object: [
+                    "type": "message_start",
+                    "message": AnthropicResponse.message(
+                        id: messageID, model: self.modelID, content: nil,
+                        stopReason: nil, stopSequence: nil,
+                        usage: ["input_tokens": 0, "output_tokens": 0]),
+                ])
+                self.writeSSEEvent(contextBox.value, name: "content_block_start", object: [
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": ["type": "text", "text": ""],
+                ])
+            }
+            activeTask = childChannels.startTask {
+                defer { streamState.stop() }
+                do {
+                    let completion = try await self.coordinator.run(onQueued: startStream) {
+                        startStream()
+                        return try await self.backend.generate(request) { event in
+                            guard request.stream, case .content(let text) = event else { return }
+                            self.writeSSEEvent(contextBox.value, name: "content_block_delta", object: [
+                                "type": "content_block_delta",
+                                "index": 0,
+                                "delta": ["type": "text_delta", "text": text],
+                            ])
+                        }
+                    }
+                    let stopReason = AnthropicResponse.stopReason(for: completion)
+                    let usage = AnthropicResponse.usage(
+                        completion.usage, outputTokens: completion.usage.completionTokens)
+                    if request.stream {
+                        self.finishMessagesStream(contextBox.value,
+                                                  stopReason: stopReason,
+                                                  stopSequence: completion.stopSequence,
+                                                  usage: usage)
+                    } else {
+                        self.writeJSON(contextBox.value, status: .ok,
+                                       object: AnthropicResponse.message(
+                                           id: messageID, model: self.modelID,
+                                           content: completion.content,
+                                           stopReason: stopReason,
+                                           stopSequence: completion.stopSequence,
+                                           usage: usage))
+                    }
+                } catch {
+                    self.handleMessagesError(error,
+                                             context: contextBox.value,
+                                             stream: streamState.isStarted)
+                }
+            }
+        } catch let error as ServerRequestError {
+            writeCodable(context,
+                         status: error == .unknownModel ? .notFound : .badRequest,
+                         AnthropicErrorEnvelope.from(error))
+        } catch {
+            writeCodable(context, status: .badRequest,
+                         AnthropicErrorEnvelope(type: "invalid_request_error",
+                                                message: "malformed JSON request"))
+        }
+    }
+
+    private func finishMessagesStream(_ context: ChannelHandlerContext,
+                                      stopReason: String,
+                                      stopSequence: String?,
+                                      usage: [String: Any]) {
+        writeSSEEvent(context, name: "content_block_stop",
+                      object: ["type": "content_block_stop", "index": 0])
+        writeSSEEvent(context, name: "message_delta", object: [
+            "type": "message_delta",
+            "delta": [
+                "stop_reason": stopReason,
+                "stop_sequence": stopSequence.map { $0 as Any } ?? NSNull(),
+            ],
+            "usage": usage,
+        ])
+        writeSSEEvent(context, name: "message_stop", object: ["type": "message_stop"])
+        endStream(context)
+    }
+
+    /// Unlike the OpenAI stream, Anthropic defines an in-band `error` event,
+    /// so a failure after the stream has begun is reported before closing.
+    private func handleMessagesError(_ error: Error,
+                                     context: ChannelHandlerContext,
+                                     stream: Bool) {
+        let status: HTTPResponseStatus
+        let envelope: AnthropicErrorEnvelope
+        if let requestError = error as? ServerRequestError {
+            status = requestError == .queueFull ? .tooManyRequests : .badRequest
+            envelope = AnthropicErrorEnvelope.from(requestError)
+        } else {
+            status = .internalServerError
+            envelope = AnthropicErrorEnvelope(type: "api_error", message: "generation failed")
+        }
+        guard stream else {
+            writeCodable(context, status: status, envelope)
+            return
+        }
+        if !(error is CancellationError) {
+            writeSSEEvent(context, name: "error", object: [
+                "type": "error",
+                "error": ["type": envelope.error.type, "message": envelope.error.message],
+            ])
+        }
+        let contextBox = SendableContext(context)
+        context.eventLoop.execute {
+            contextBox.value.close(promise: nil)
+        }
+    }
+
+    private func writeSSEEvent(_ context: ChannelHandlerContext,
+                               name: String,
+                               object: [String: Any]) {
+        guard let data = try? JSONSerialization.data(withJSONObject: object) else { return }
+        let contextBox = SendableContext(context)
+        context.eventLoop.execute {
+            var buffer = contextBox.value.channel.allocator.buffer(capacity: data.count + name.utf8.count + 16)
+            buffer.writeString("event: \(name)\ndata: ")
+            buffer.writeBytes(data)
+            buffer.writeString("\n\n")
+            contextBox.value.writeAndFlush(
+                self.wrapOutboundOut(.body(.byteBuffer(buffer))), promise: nil)
+        }
+    }
+
+    private func endStream(_ context: ChannelHandlerContext) {
+        let contextBox = SendableContext(context)
+        context.eventLoop.execute {
+            contextBox.value.writeAndFlush(self.wrapOutboundOut(.end(nil)), promise: nil)
         }
     }
 
